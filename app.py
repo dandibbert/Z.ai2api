@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 from threading import Lock
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 from flask import (
         Flask,
         Response,
@@ -73,6 +74,18 @@ def _client_ip() -> str:
         if forwarded:
                 return forwarded.split(",")[0].strip()
         return request.remote_addr or ""
+
+
+def _format_upstream_path(url: str) -> str:
+        if not url:
+                return ""
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query:
+                path = f"{path}?{parsed.query}"
+        if parsed.netloc:
+                return f"{parsed.netloc}{path}"
+        return url
 
 
 def _parse_token_pool(raw: str) -> List[str]:
@@ -211,8 +224,8 @@ class RequestMetrics:
                 self._recent_requests: deque = deque(maxlen=100)
                 self._token_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"success": 0, "failure": 0, "source": "unknown"})
 
-        def record(self, *, method: str, path: str, status_code: int, duration: float, client_ip: str, token_info: Optional[Dict[str, Any]]):
-                success = 200 <= status_code < 400
+        def record(self, *, method: str, path: str, status_code: Optional[int], duration: float, client_ip: str, token_info: Optional[Dict[str, Any]], error: Optional[str] = None):
+                success = status_code is not None and 200 <= status_code < 400
                 token_source = "none"
                 token_value = None
                 token_display = ""
@@ -242,13 +255,16 @@ class RequestMetrics:
                                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                                 "method": method,
                                 "path": path,
-                                "status": status_code,
+                                "status": status_code if status_code is not None else 0,
                                 "duration_ms": round(duration * 1000, 2),
                                 "client_ip": client_ip,
                                 "token_display": token_display,
                                 "token_source": token_source,
                         }
+                        if error:
+                                entry["error"] = error
                         self._recent_requests.appendleft(entry)
+                        return entry
 
         def snapshot(self) -> Dict[str, Any]:
                 with self._lock:
@@ -282,6 +298,50 @@ class RequestMetrics:
 
 
 request_metrics = RequestMetrics()
+
+
+def _record_upstream_metrics(*, method: str, url: str, status_code: Optional[int], duration: float, error: Optional[str] = None):
+        try:
+                client_ip = _client_ip()
+        except Exception:
+                client_ip = ""
+        token_info = getattr(g, "current_token_info", None)
+        path = _format_upstream_path(url)
+        return request_metrics.record(
+                method=method,
+                path=path,
+                status_code=status_code,
+                duration=duration,
+                client_ip=client_ip,
+                token_info=token_info,
+                error=error,
+        )
+
+
+def _finalize_upstream_response(response, *, error: Optional[str] = None):
+        context = getattr(response, "_metrics_context", None)
+        if not context or context.get("finalized"):
+                return
+        context["finalized"] = True
+        start_time = context.get("start_time")
+        url = context.get("url") or getattr(response, "url", "")
+        method = context.get("method", "POST")
+        duration = time.perf_counter() - start_time if start_time else 0.0
+        status_code = response.status_code if error is None else None
+        _record_upstream_metrics(
+                method=method,
+                url=url,
+                status_code=status_code,
+                duration=duration,
+                error=error,
+        )
+        token = context.get("token")
+        if token_pool.contains(token):
+                success = error is None and status_code is not None and 200 <= status_code < 400
+                if success:
+                        token_pool.mark_success(token)
+                else:
+                        token_pool.mark_failure(token)
 
 
 def _has_valid_auth() -> bool:
@@ -1003,27 +1063,9 @@ phaseBak = "thinking"
 
 @app.before_request
 def _setup_request_context():
-        g.request_start = time.perf_counter()
         g.current_token_info = {"token": None, "source": "none"}
 
 
-@app.after_request
-def _record_request_metrics(response):
-        try:
-                start = getattr(g, "request_start", None)
-                duration = time.perf_counter() - start if start else 0.0
-                token_info = getattr(g, "current_token_info", None)
-                request_metrics.record(
-                        method=request.method,
-                        path=request.path,
-                        status_code=response.status_code,
-                        duration=duration,
-                        client_ip=_client_ip(),
-                        token_info=token_info,
-                )
-        except Exception as exc:
-                debug("记录请求指标失败: %s", exc)
-        return response
 # 工具函数
 class utils:
         @staticmethod
@@ -1035,24 +1077,37 @@ class utils:
                         headers = {**BROWSER_HEADERS, "Referer": f"{BASE}/c/{chat_id}"}
                         if token:
                                 headers["Authorization"] = f"Bearer {token}"
+                        url = f"{BASE}/api/chat/completions"
+                        start_time = time.perf_counter()
                         try:
                                 response = requests.post(
-                                        f"{BASE}/api/chat/completions",
+                                        url,
                                         json=data,
                                         headers=headers,
                                         stream=True,
                                         timeout=60
                                 )
-                                if token_pool.contains(token):
-                                        if response.status_code in (401, 403):
-                                                token_pool.mark_failure(token)
-                                        else:
-                                                token_pool.mark_success(token)
-                                return response
                         except Exception as e:
+                                duration = time.perf_counter() - start_time
+                                _record_upstream_metrics(
+                                        method="POST",
+                                        url=url,
+                                        status_code=None,
+                                        duration=duration,
+                                        error=str(e),
+                                )
                                 if token_pool.contains(token):
                                         token_pool.mark_failure(token)
                                 raise e
+
+                        response._metrics_context = {
+                                "start_time": start_time,
+                                "url": url,
+                                "method": "POST",
+                                "token": token,
+                                "finalized": False,
+                        }
+                        return response
                 @staticmethod
                 def image(data_url, chat_id):
                         try:
@@ -1071,12 +1126,23 @@ class utils:
                                 if token:
                                         headers["Authorization"] = f"Bearer {token}"
 
+                                url = f"{BASE}/api/v1/files/"
+                                start_time = time.perf_counter()
+                                recorded = False
                                 response = requests.post(
-                                        f"{BASE}/api/v1/files/",
+                                        url,
                                         files={"file": (filename, image_data, mime_type)},
                                         headers=headers,
                                         timeout=30
                                 )
+                                duration = time.perf_counter() - start_time
+                                _record_upstream_metrics(
+                                        method="POST",
+                                        url=url,
+                                        status_code=response.status_code,
+                                        duration=duration,
+                                )
+                                recorded = True
 
                                 if token_pool.contains(token):
                                         if response.status_code in (401, 403):
@@ -1090,6 +1156,15 @@ class utils:
                                 else:
                                         raise Exception(response.text)
                         except Exception as e:
+                                if 'start_time' in locals() and not recorded:
+                                        duration = time.perf_counter() - start_time
+                                        _record_upstream_metrics(
+                                                method="POST",
+                                                url=url,
+                                                status_code=None,
+                                                duration=duration,
+                                                error=str(e),
+                                        )
                                 debug("图片上传失败: %s", e)
                         return None
                 @staticmethod
@@ -1281,7 +1356,18 @@ def models():
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        response = requests.get(f"{BASE}/api/models", headers=headers, timeout=8)
+        url = f"{BASE}/api/models"
+        start_time = time.perf_counter()
+        recorded = False
+        response = requests.get(url, headers=headers, timeout=8)
+        duration = time.perf_counter() - start_time
+        _record_upstream_metrics(
+            method="GET",
+            url=url,
+            status_code=response.status_code,
+            duration=duration,
+        )
+        recorded = True
         if token_pool.contains(token):
             if response.status_code in (401, 403):
                 token_pool.mark_failure(token)
@@ -1346,6 +1432,15 @@ def models():
 
         return utils.request.response(jsonify({"object": "list", "data": models}))
     except Exception as e:
+        if 'url' in locals() and 'start_time' in locals() and not recorded:
+            duration = time.perf_counter() - start_time
+            _record_upstream_metrics(
+                method="GET",
+                url=url,
+                status_code=None,
+                duration=duration,
+                error=str(e),
+            )
         debug("模型列表失败: %s", e)
         return utils.request.response(jsonify({"error": "fetch models failed"})), 500
 
@@ -1448,54 +1543,97 @@ def OpenAI_Compatible():
         if stream:
                 def stream():
                         completion_str = ""
+                        completion_tokens = 0
+                        error_message: Optional[str] = None
 
-                        # 处理流式响应数据
-                        for data in utils.response.parse(response):
-                                is_done = data.get("data", {}).get("done", False)
-                                delta = utils.response.format(data)
-                                finish_reason = "stop" if is_done else None
+                        if response.status_code and response.status_code >= 400:
+                                try:
+                                        error_body = response.text
+                                except Exception:
+                                        error_body = ""
+                                error_body = (error_body or "").strip()
+                                if len(error_body) > 500:
+                                        error_body = f"{error_body[:497]}..."
+                                if error_body:
+                                        error_message = f"上游返回错误 {response.status_code}: {error_body}"
+                                else:
+                                        error_message = f"上游返回错误 {response.status_code}"
+                                debug(error_message)
+                        else:
+                                try:
+                                        for data in utils.response.parse(response):
+                                                is_done = data.get("data", {}).get("done", False)
+                                                delta = utils.response.format(data)
+                                                finish_reason = "stop" if is_done else None
 
-                                if delta:
-                                        yield f"data: {json.dumps({
-                                                "id": utils.request.id('chatcmpl'),
-                                                "object": "chat.completion.chunk",
-                                                "created": int(datetime.now().timestamp()),
-                                                "model": model,
-                                                "choices": [
-                                                        {
-                                                                "index": 0,
-                                                                "delta": delta,
-                                                                "message": delta,
-                                                                "finish_reason": finish_reason
-                                                        }
-                                                ]
-                                        })}\n\n"
+                                                if delta:
+                                                        yield f"data: {json.dumps({
+                                                                "id": utils.request.id('chatcmpl'),
+                                                                "object": "chat.completion.chunk",
+                                                                "created": int(datetime.now().timestamp()),
+                                                                "model": model,
+                                                                "choices": [
+                                                                        {
+                                                                                "index": 0,
+                                                                                "delta": delta,
+                                                                                "message": delta,
+                                                                                "finish_reason": finish_reason
+                                                                        }
+                                                                ]
+                                                        })}\n\n"
 
-                                        # 累积实际生成的内容
-                                        if "content" in delta:
-                                                completion_str += delta["content"]
-                                        if "reasoning_content" in delta:
-                                                completion_str += delta["reasoning_content"]
-                                        completion_tokens = utils.response.count(completion_str) # 计算 tokens
-                                if is_done:
-                                        yield f"data: {json.dumps({
-                                                'id': utils.request.id('chatcmpl'),
-                                                'object': 'chat.completion.chunk',
-                                                'created': int(datetime.now().timestamp()),
-                                                'model': model,
-                                                'choices': [
-                                                        {
-                                                                'index': 0,
-                                                                'delta': {"role": "assistant"},
-                                                                'message': {"role": "assistant"},
-                                                                'finish_reason': "stop"
-                                                        }
-                                                ]
-                                        })}\n\n"
-                                        break
+                                                        if "content" in delta:
+                                                                completion_str += delta["content"]
+                                                        if "reasoning_content" in delta:
+                                                                completion_str += delta["reasoning_content"]
+                                                        completion_tokens = utils.response.count(completion_str)
 
-                        if include_usage:
-                                # 发送 usage 统计信息
+                                                if is_done:
+                                                        yield f"data: {json.dumps({
+                                                                'id': utils.request.id('chatcmpl'),
+                                                                'object': 'chat.completion.chunk',
+                                                                'created': int(datetime.now().timestamp()),
+                                                                'model': model,
+                                                                'choices': [
+                                                                        {
+                                                                                'index': 0,
+                                                                                'delta': {"role": "assistant"},
+                                                                                'message': {"role": "assistant"},
+                                                                                'finish_reason': "stop"
+                                                                        }
+                                                                ]
+                                                        })}\n\n"
+                                                        break
+                                except GeneratorExit:
+                                        _finalize_upstream_response(response, error="client disconnected")
+                                        raise
+                                except requests.exceptions.ChunkedEncodingError as exc:
+                                        error_message = f"上游响应中断: {exc}"
+                                        debug(error_message)
+                                except requests.exceptions.RequestException as exc:
+                                        error_message = f"上游响应异常: {exc}"
+                                        debug(error_message)
+                                except Exception as exc:
+                                        error_message = f"解析上游响应失败: {exc}"
+                                        debug(error_message)
+
+                        if error_message:
+                                yield f"data: {json.dumps({
+                                        "id": utils.request.id('chatcmpl'),
+                                        "object": "chat.completion.chunk",
+                                        "created": int(datetime.now().timestamp()),
+                                        "model": model,
+                                        "choices": [
+                                                {
+                                                        "index": 0,
+                                                        "delta": {},
+                                                        "message": {},
+                                                        "finish_reason": "error"
+                                                }
+                                        ],
+                                        "error": {"message": error_message}
+                                })}\n\n"
+                        elif include_usage:
                                 yield f"data: {json.dumps({
                                         "id": utils.request.id('chatcmpl'),
                                         "object": "chat.completion.chunk",
@@ -1509,10 +1647,9 @@ def OpenAI_Compatible():
                                         }
                                 })}\n\n"
 
-                        # 发送 [DONE] 标志，表示流结束
                         yield "data: [DONE]\n\n"
+                        _finalize_upstream_response(response, error=error_message)
 
-                # 返回 Flask 的流式响应
                 return Response(stream(), mimetype="text/event-stream")
         else:
                 # 上游不支持非流式，所以先用流式获取所有内容
@@ -1520,15 +1657,49 @@ def OpenAI_Compatible():
                         "content": [],
                         "reasoning_content": []
                 }
-                for odata in utils.response.parse(response):
-                        if odata.get("data", {}).get("done"):
-                                break
-                        delta = utils.response.format(odata)
-                        if delta:
-                                if "content" in delta:
-                                        contents["content"].append(delta["content"])
-                                if "reasoning_content" in delta:
-                                        contents["reasoning_content"].append(delta["reasoning_content"])
+                error_message: Optional[str] = None
+                if response.status_code and response.status_code >= 400:
+                        try:
+                                error_body = response.text
+                        except Exception:
+                                error_body = ""
+                        error_body = (error_body or "").strip()
+                        if len(error_body) > 500:
+                                error_body = f"{error_body[:497]}..."
+                        if error_body:
+                                error_message = f"上游返回错误 {response.status_code}: {error_body}"
+                        else:
+                                error_message = f"上游返回错误 {response.status_code}"
+                        debug(error_message)
+                if not error_message:
+                        try:
+                                for odata in utils.response.parse(response):
+                                        if odata.get("data", {}).get("done"):
+                                                break
+                                        delta = utils.response.format(odata)
+                                        if delta:
+                                                if "content" in delta:
+                                                        contents["content"].append(delta["content"])
+                                                if "reasoning_content" in delta:
+                                                        contents["reasoning_content"].append(delta["reasoning_content"])
+                        except requests.exceptions.ChunkedEncodingError as exc:
+                                error_message = f"上游响应中断: {exc}"
+                                debug(error_message)
+                        except requests.exceptions.RequestException as exc:
+                                error_message = f"上游响应异常: {exc}"
+                                debug(error_message)
+                        except Exception as exc:
+                                error_message = f"解析上游响应失败: {exc}"
+                                debug(error_message)
+
+                if error_message:
+                        _finalize_upstream_response(response, error=error_message)
+                        payload = {
+                                "error": {
+                                        "message": error_message,
+                                }
+                        }
+                        return utils.request.response(make_response(jsonify(payload), 502))
 
                 # 构建最终消息内容
                 final_message = {"role": "assistant"}
@@ -1542,6 +1713,7 @@ def OpenAI_Compatible():
                 completion_tokens = utils.response.count(completion_str) # 计算 tokens
 
                 # 返回 Flask 响应
+                _finalize_upstream_response(response, error=None)
         return utils.request.response(jsonify({
                         "id": utils.request.id("chatcmpl"),
                         "object": "chat.completion",
