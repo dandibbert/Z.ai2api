@@ -1465,11 +1465,23 @@ class utils:
                         return fallback_token or ""
                 @staticmethod
                 def response(resp):
-                        resp.headers.update({
-                                "Access-Control-Allow-Origin": "*",
-                                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-                        })
+                        origin = request.headers.get("Origin")
+                        if origin:
+                                resp.headers["Access-Control-Allow-Origin"] = origin
+                                resp.headers["Vary"] = (
+                                        f"{resp.headers.get('Vary')}, Origin"
+                                        if resp.headers.get("Vary")
+                                        else "Origin"
+                                )
+                                resp.headers["Access-Control-Allow-Credentials"] = "true"
+                        else:
+                                resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+
+                        allowed_methods = "GET, POST, DELETE, OPTIONS"
+                        resp.headers["Access-Control-Allow-Methods"] = allowed_methods
+                        resp.headers["Access-Control-Allow-Headers"] = (
+                                "Content-Type, Authorization, X-Auth-Token"
+                        )
                         return resp
         @staticmethod
         class response:
@@ -2053,8 +2065,10 @@ def dashboard_logout():
         return utils.request.response(flask_response)
 
 
-@app.route("/dashboard/api/overview", methods=["GET"])
+@app.route("/dashboard/api/overview", methods=["GET", "OPTIONS"])
 def dashboard_overview():
+        if request.method == "OPTIONS":
+                return utils.request.response(make_response())
         auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
@@ -2075,8 +2089,10 @@ def dashboard_overview():
         return utils.request.response(jsonify(payload))
 
 
-@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE"])
+@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE", "OPTIONS"])
 def dashboard_tokens():
+        if request.method == "OPTIONS":
+                return utils.request.response(make_response())
         auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
