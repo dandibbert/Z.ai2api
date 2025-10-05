@@ -518,6 +518,23 @@ def _require_dashboard_auth():
         return utils.request.response(make_response(response, 401))
 
 
+def _build_dashboard_payload() -> Dict[str, Any]:
+        metrics_snapshot = request_metrics.snapshot()
+        token_snapshot = token_pool.snapshot()
+        return {
+                "anonymous_mode": ANONYMOUS_MODE,
+                "stats": {
+                        "total_requests": metrics_snapshot.get("total_requests", 0),
+                        "success_requests": metrics_snapshot.get("success_requests", 0),
+                        "failure_requests": metrics_snapshot.get("failure_requests", 0),
+                        "average_response_time": metrics_snapshot.get("average_response_time", 0),
+                },
+                "recent_requests": metrics_snapshot.get("recent_requests", []),
+                "token_stats": metrics_snapshot.get("token_stats", []),
+                "token_pool": token_snapshot,
+        }
+
+
 STATUS_PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang=\"zh-CN\">
@@ -805,7 +822,7 @@ DASHBOARD_TEMPLATE = """
         <section style=\"margin-top:24px;\">
             <div class=\"section-header\">
                 <h2>Token 管理</h2>
-                <form id=\"add-token-form\">
+                <form id=\"add-token-form\" method=\"post\" action=\"/dashboard/api/tokens\">
                     <textarea id=\"new-token\" name=\"token\" placeholder=\"粘贴新 Token（支持逗号或换行批量添加）\" autocomplete=\"off\" required spellcheck=\"false\"></textarea>
                     <button type=\"submit\">添加 Token</button>
                 </form>
@@ -829,6 +846,7 @@ DASHBOARD_TEMPLATE = """
             </div>
         </section>
     </main>
+    <script type="application/json" id="dashboard-initial-data">{{ initial_data|safe }}</script>
     <script>
     (() => {
         const autoRefreshToggle = document.getElementById('auto-refresh');
@@ -843,7 +861,20 @@ DASHBOARD_TEMPLATE = """
         const addTokenForm = document.getElementById('add-token-form');
         const newTokenInput = document.getElementById('new-token');
         const logoutBtn = document.getElementById('logout-btn');
+        const defaultAnonymousMode = {{ 'true' if anonymous_mode else 'false' }};
+        const initialDataEl = document.getElementById('dashboard-initial-data');
+        let initialData = null;
         let timer = null;
+        let useAjaxSubmission = true;
+
+        if (initialDataEl) {
+            try {
+                initialData = JSON.parse(initialDataEl.textContent || '{}');
+            } catch (err) {
+                console.error('解析初始数据失败', err);
+                initialData = null;
+            }
+        }
 
         const escapeHtml = (value) => {
             if (value === undefined || value === null) return '';
@@ -864,7 +895,7 @@ DASHBOARD_TEMPLATE = """
                     <td>${escapeHtml(item.timestamp)}</td>
                     <td>${escapeHtml(item.method)}</td>
                     <td>${escapeHtml(item.path)}</td>
-                    <td><span class=\"badge ${item.status >= 400 ? 'danger' : 'success'}\">${item.status}</span></td>
+                    <td><span class="badge ${item.status >= 400 ? 'danger' : 'success'}">${item.status}</span></td>
                     <td>${item.duration_ms}</td>
                     <td>${escapeHtml(item.client_ip)}</td>
                     <td>${escapeHtml(item.token_display)}</td>
@@ -940,7 +971,7 @@ DASHBOARD_TEMPLATE = """
             }
             tokensBody.innerHTML = rows.map(item => {
                 const status = item.source === 'anonymous' ? '匿名' : (item.disabled ? '禁用' : '活跃');
-                const actionButton = item.token_id ? `<button type=\"button\" class=\"ghost\" data-token-id=\"${escapeHtml(item.token_id)}\">移除</button>` : '';
+                const actionButton = item.token_id ? `<button type="button" class="ghost" data-token-id="${escapeHtml(item.token_id)}">移除</button>` : '';
                 return `
                     <tr>
                         <td>${escapeHtml(item.display)}</td>
@@ -953,6 +984,28 @@ DASHBOARD_TEMPLATE = """
                     </tr>
                 `;
             }).join('');
+        }
+
+        function applyOverview(data) {
+            if (!data || typeof data !== 'object' || !data.stats) {
+                totalEl.textContent = '0';
+                successEl.textContent = '0';
+                failureEl.textContent = '0';
+                averageEl.textContent = '0';
+                modeIndicator.textContent = defaultAnonymousMode ? '匿名模式' : '非匿名模式';
+                renderRequests([]);
+                renderTokens([], { tokens: [] });
+                return;
+            }
+            const stats = data.stats || {};
+            const anonymous = typeof data.anonymous_mode === 'boolean' ? data.anonymous_mode : defaultAnonymousMode;
+            totalEl.textContent = stats.total_requests !== undefined ? stats.total_requests : 0;
+            successEl.textContent = stats.success_requests !== undefined ? stats.success_requests : 0;
+            failureEl.textContent = stats.failure_requests !== undefined ? stats.failure_requests : 0;
+            averageEl.textContent = stats.average_response_time !== undefined ? stats.average_response_time : 0;
+            modeIndicator.textContent = anonymous ? '匿名模式' : '非匿名模式';
+            renderRequests(Array.isArray(data.recent_requests) ? data.recent_requests : []);
+            renderTokens(data.token_stats, data.token_pool || { tokens: [] });
         }
 
         function scheduleRefresh(enabled) {
@@ -976,19 +1029,12 @@ DASHBOARD_TEMPLATE = """
                     throw new Error(`HTTP ${res.status}`);
                 }
                 const data = await res.json();
-                totalEl.textContent = data.stats.total_requests;
-                successEl.textContent = data.stats.success_requests;
-                failureEl.textContent = data.stats.failure_requests;
-                averageEl.textContent = data.stats.average_response_time;
-                modeIndicator.textContent = data.anonymous_mode ? '匿名模式' : '非匿名模式';
-                renderRequests(data.recent_requests);
-                renderTokens(data.token_stats, data.token_pool);
+                applyOverview(data);
                 lastUpdated.textContent = `更新于 ${new Date().toLocaleTimeString()}`;
             } catch (err) {
                 console.error('刷新仪表盘失败', err);
                 lastUpdated.textContent = '刷新失败，稍后自动重试';
-                renderRequests([]);
-                renderTokens([], { tokens: [] });
+                applyOverview(null);
             }
         }
 
@@ -1007,9 +1053,13 @@ DASHBOARD_TEMPLATE = """
         });
 
         addTokenForm.addEventListener('submit', async (event) => {
+            if (!useAjaxSubmission) {
+                return;
+            }
             event.preventDefault();
             const tokens = newTokenInput.value
-                .split(/[\r\n,]+/)
+                .split(/[
+,]+/)
                 .map(item => item.trim())
                 .filter(Boolean);
             if (!tokens.length) return;
@@ -1028,10 +1078,14 @@ DASHBOARD_TEMPLATE = """
                     throw new Error(`HTTP ${res.status}`);
                 }
                 newTokenInput.value = '';
-                fetchOverview();
+                const data = await res.json();
+                applyOverview(data);
+                lastUpdated.textContent = `更新于 ${new Date().toLocaleTimeString()}`;
             } catch (err) {
                 console.error('添加 Token 失败', err);
-                alert('添加失败，请检查日志');
+                alert('添加失败，尝试使用表单回退提交。');
+                useAjaxSubmission = false;
+                addTokenForm.submit();
             }
         });
 
@@ -1054,7 +1108,9 @@ DASHBOARD_TEMPLATE = """
                 if (!res.ok) {
                     throw new Error(`HTTP ${res.status}`);
                 }
-                fetchOverview();
+                const data = await res.json();
+                applyOverview(data);
+                lastUpdated.textContent = `更新于 ${new Date().toLocaleTimeString()}`;
             } catch (err) {
                 console.error('移除 Token 失败', err);
                 alert('移除失败，请重试');
@@ -1069,6 +1125,13 @@ DASHBOARD_TEMPLATE = """
                     window.location.href = '/dashboard';
                 }
             });
+        }
+
+        if (initialData) {
+            applyOverview(initialData);
+            lastUpdated.textContent = '已加载当前快照';
+        } else {
+            applyOverview(null);
         }
 
         fetchOverview();
@@ -2058,7 +2121,13 @@ def dashboard():
                         error=error,
                         auth_required=bool(AUTH_TOKEN),
                 )
-        return render_template_string(DASHBOARD_TEMPLATE, anonymous_mode=ANONYMOUS_MODE)
+        payload = _build_dashboard_payload()
+        initial_data = json.dumps(payload, ensure_ascii=False)
+        return render_template_string(
+                DASHBOARD_TEMPLATE,
+                anonymous_mode=ANONYMOUS_MODE,
+                initial_data=initial_data,
+        )
 
 
 @app.route("/dashboard/logout", methods=["POST"])
@@ -2075,20 +2144,7 @@ def dashboard_overview():
         auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
-        metrics_snapshot = request_metrics.snapshot()
-        token_snapshot = token_pool.snapshot()
-        payload = {
-                "anonymous_mode": ANONYMOUS_MODE,
-                "stats": {
-                        "total_requests": metrics_snapshot.get("total_requests", 0),
-                        "success_requests": metrics_snapshot.get("success_requests", 0),
-                        "failure_requests": metrics_snapshot.get("failure_requests", 0),
-                        "average_response_time": metrics_snapshot.get("average_response_time", 0),
-                },
-                "recent_requests": metrics_snapshot.get("recent_requests", []),
-                "token_stats": metrics_snapshot.get("token_stats", []),
-                "token_pool": token_snapshot,
-        }
+        payload = _build_dashboard_payload()
         return utils.request.response(jsonify(payload))
 
 
@@ -2105,7 +2161,13 @@ def dashboard_tokens():
                         "token_stats": metrics_snapshot.get("token_stats", []),
                 }))
 
-        data = request.get_json(force=True, silent=True) or {}
+        expects_json = request.is_json or "application/json" in (request.headers.get("Accept", "").lower())
+        data: Dict[str, Any] = {}
+        if request.is_json:
+                data = request.get_json(silent=True) or {}
+        else:
+                data = {key: request.form.getlist(key) for key in request.form.keys()}
+
         token_inputs: List[str] = []
         for value in (data.get("tokens"), data.get("token")):
                 token_inputs.extend(_normalize_token_inputs(value))
@@ -2125,7 +2187,9 @@ def dashboard_tokens():
                 effective_tokens = list(dict.fromkeys(token_inputs + resolved_tokens))
 
         if not effective_tokens:
-                return utils.request.response(make_response(jsonify({"error": "token required"}), 400))
+                if expects_json:
+                        return utils.request.response(make_response(jsonify({"error": "token required"}), 400))
+                return utils.request.response(redirect(url_for("dashboard")))
 
         current_tokens = token_pool.tokens()
         if request.method == "POST":
@@ -2136,13 +2200,11 @@ def dashboard_tokens():
                                 updated = True
                 if updated:
                         _update_token_pool(current_tokens)
-                snapshot = token_pool.snapshot()
-                metrics_snapshot = request_metrics.snapshot()
-                return utils.request.response(jsonify({
-                        "ok": True,
-                        "token_pool": snapshot,
-                        "token_stats": metrics_snapshot.get("token_stats", []),
-                }))
+                payload = _build_dashboard_payload()
+                payload["ok"] = True
+                if expects_json:
+                        return utils.request.response(jsonify(payload))
+                return utils.request.response(redirect(url_for("dashboard")))
 
         removed = False
         for candidate in effective_tokens:
@@ -2151,13 +2213,11 @@ def dashboard_tokens():
                         removed = True
         if removed:
                 _update_token_pool(current_tokens)
-        snapshot = token_pool.snapshot()
-        metrics_snapshot = request_metrics.snapshot()
-        return utils.request.response(jsonify({
-                "ok": True,
-                "token_pool": snapshot,
-                "token_stats": metrics_snapshot.get("token_stats", []),
-        }))
+        payload = _build_dashboard_payload()
+        payload["ok"] = True
+        if expects_json:
+                return utils.request.response(jsonify(payload))
+        return utils.request.response(redirect(url_for("dashboard")))
 
 # 主入口
 if __name__ == "__main__":
