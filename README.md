@@ -49,6 +49,316 @@
 - `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
   - 返回的 `token_id` 为不可逆的哈希标识，仪表盘中也只会显示 `token:xxxxxxxx` 形式的脱敏文本；若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
 
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 如果已配置 `AUTH_TOKEN`，可以在地址后追加 `?token=<AUTH_TOKEN>`（或 `?auth_token=`）快速完成一次性登录。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- 登录成功后才可访问 `/dashboard/api/*` 接口，如遇 401 可重新打开 `/dashboard` 输入密码或在请求 URL 中添加 `auth_token=<AUTH_TOKEN>`/`token=<AUTH_TOKEN>`。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+  - 返回的 `token_id` 为不可逆的哈希标识，仪表盘中也只会显示 `token:xxxxxxxx` 形式的脱敏文本；若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 如果已配置 `AUTH_TOKEN`，可以在地址后追加 `?token=<AUTH_TOKEN>`（或 `?auth_token=`）快速完成一次性登录。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- 登录成功后才可访问 `/dashboard/api/*` 接口，如遇 401 可重新打开 `/dashboard` 输入密码或在请求 URL 中添加 `auth_token=<AUTH_TOKEN>`/`token=<AUTH_TOKEN>`。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+  - 返回的 `token_id` 为不可逆的哈希标识，仪表盘中也只会显示 `token:xxxxxxxx` 形式的脱敏文本；若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 如果已配置 `AUTH_TOKEN`，可以在地址后追加 `?token=<AUTH_TOKEN>`（或 `?auth_token=`）快速完成一次性登录。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- 登录成功后才可访问 `/dashboard/api/*` 接口，如遇 401 可重新打开 `/dashboard` 输入密码或在请求 URL 中添加 `auth_token=<AUTH_TOKEN>`/`token=<AUTH_TOKEN>`。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+  - 返回的 `token_id` 为不可逆的哈希标识，仪表盘中也只会显示 `token:xxxxxxxx` 形式的脱敏文本；若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 如果已配置 `AUTH_TOKEN`，可以在地址后追加 `?token=<AUTH_TOKEN>`（或 `?auth_token=`）快速完成一次性登录。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- 登录成功后才可访问 `/dashboard/api/*` 接口，如遇 401 可重新打开 `/dashboard` 输入密码或在请求 URL 中添加 `auth_token=<AUTH_TOKEN>`/`token=<AUTH_TOKEN>`。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+  - 返回的 `token_id` 为不可逆的哈希标识，仪表盘中也只会显示 `token:xxxxxxxx` 形式的脱敏文本；若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- 登录成功后才可访问 `/dashboard/api/*` 接口，如遇 401 可重新打开 `/dashboard` 输入密码。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+  - 返回的 `token_id` 为不可逆的哈希标识，仪表盘中也只会显示 `token:xxxxxxxx` 形式的脱敏文本；若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+  - 返回的 `token_id` 为不可逆的哈希标识，若需删除令牌可在 Dashboard 中操作或调用 `/dashboard/api/tokens` 并传入对应 `token_id`。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/` 可查看轻量状态页。
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、支持逗号或换行批量粘贴、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
+
+## 监控面板与接口
+
+- 访问 `http://<host>:<port>/dashboard` 即可使用内置监控面板。
+- 若设置了 `AUTH_TOKEN`，同样的口令将作为面板登录密码以及 API 访问的 Bearer Token。
+- 面板提供：
+  - 请求统计卡片（总请求数、成功/失败次数、平均响应时长）。
+  - 最近 100 条请求明细（时间、方法、路径、状态码、耗时、客户端 IP、使用的令牌）。
+  - 令牌池管理（新增 / 删除令牌实时生效、查看禁用状态与冷却时间、统计成功/失败次数）。
+  - 自动刷新（默认 5 秒，可在界面关闭）。
+- `/token-pool/status` 返回 JSON 快照，可用于外部监控程序。
+
+## 模型别名与变体
+
+项目会为常见模型提供统一别名，并在此基础上扩展 `-Thinking` 与 `-Search` 变体：
+
+| 上游 ID | 别名 |
+| --- | --- |
+| `0727-360B-API` | `GLM-4.5` |
+| `glm-4.5v` | `GLM-4.5V` |
+| `0727-106B-API` | `GLM-4.5-Air` |
+| `0808-360B-DR` | `0808-360b-Dr` |
+| `deep-research` | `Z1-Rumination` |
+| `GLM-4-6-API-V1` | `GLM-4.6` |
+| `glm-4-flash` | `GLM-4-Flash` |
+| `GLM-4.1V-Thinking-FlashX` | `GLM-4.1V-Thinking-FlashX` |
+| `main_chat` | `GLM-4-32B` |
+| `zero` | `Z1-32B` |
+
+使用 `-Thinking` 变体会强制开启推理内容输出，`-Search` 变体会自动注入联网搜索所需的特性与 MCP 配置；未带后缀的别名保持上游默认能力。
 ## 要求
 ![Python 3.12+](https://img.shields.io/badge/3.12%2B-blue?style=for-the-badge&logo=python&label=python)
 ![.env](https://img.shields.io/badge/.env-%23555?style=for-the-badge&logo=.env)
