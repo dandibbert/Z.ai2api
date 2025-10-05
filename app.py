@@ -478,11 +478,7 @@ def _clear_dashboard_session():
         session.modified = True
 
 
-def _has_valid_api_auth() -> bool:
-        if not AUTH_TOKEN:
-                return True
-        if session.get("authenticated"):
-                return True
+def _extract_auth_token() -> str:
         auth_header = request.headers.get("Authorization", "").strip()
         candidate = ""
         if auth_header:
@@ -494,6 +490,17 @@ def _has_valid_api_auth() -> bool:
                 candidate = request.headers.get("X-Auth-Token", "").strip()
         if not candidate:
                 candidate = request.args.get("auth_token", "").strip()
+        if not candidate:
+                candidate = request.args.get("token", "").strip()
+        return candidate
+
+
+def _has_valid_api_auth() -> bool:
+        if not AUTH_TOKEN:
+                return True
+        if session.get("authenticated"):
+                return True
+        candidate = _extract_auth_token()
         return candidate == AUTH_TOKEN
 
 
@@ -505,7 +512,7 @@ def _require_api_auth():
 
 
 def _require_dashboard_auth():
-        if _has_dashboard_session():
+        if _has_dashboard_session() or _has_valid_api_auth():
                 return None
         response = jsonify({"error": "unauthorized"})
         return utils.request.response(make_response(response, 401))
@@ -960,7 +967,7 @@ DASHBOARD_TEMPLATE = """
 
         async function fetchOverview() {
             try {
-                const res = await fetch('/dashboard/api/overview', { credentials: 'same-origin' });
+                const res = await fetch('/dashboard/api/overview', { credentials: 'include' });
                 if (res.status === 401) {
                     window.location.href = '/dashboard';
                     return;
@@ -1010,7 +1017,7 @@ DASHBOARD_TEMPLATE = """
                 const res = await fetch('/dashboard/api/tokens', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    credentials: 'same-origin',
+                    credentials: 'include',
                     body: JSON.stringify({ tokens }),
                 });
                 if (res.status === 401) {
@@ -1037,7 +1044,7 @@ DASHBOARD_TEMPLATE = """
                 const res = await fetch('/dashboard/api/tokens', {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' },
-                    credentials: 'same-origin',
+                    credentials: 'include',
                     body: JSON.stringify({ token_id: tokenId }),
                 });
                 if (res.status === 401) {
@@ -1057,7 +1064,7 @@ DASHBOARD_TEMPLATE = """
         if (logoutBtn) {
             logoutBtn.addEventListener('click', async () => {
                 try {
-                    await fetch('/dashboard/logout', { method: 'POST', credentials: 'same-origin' });
+                    await fetch('/dashboard/logout', { method: 'POST', credentials: 'include' });
                 } finally {
                     window.location.href = '/dashboard';
                 }
@@ -2014,6 +2021,11 @@ def token_pool_status():
 @app.route("/dashboard", methods=["GET", "POST"])
 def dashboard():
         error = None
+        if AUTH_TOKEN:
+                auto_token = _extract_auth_token()
+                if auto_token and auto_token == AUTH_TOKEN and not _has_dashboard_session():
+                        _establish_dashboard_session()
+                        return redirect(url_for("dashboard"))
         if request.method == "POST":
                 if not AUTH_TOKEN:
                         _establish_dashboard_session()
