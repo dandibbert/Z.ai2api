@@ -7,6 +7,8 @@ Z.ai 2 API
 
 import os, json, re, requests, logging, uuid, base64
 from datetime import datetime
+from threading import Lock
+from typing import Any, Dict, List, Optional
 from flask import Flask, request, Response, jsonify, make_response
 
 from dotenv import load_dotenv
@@ -20,6 +22,10 @@ TOKEN = str(os.getenv("TOKEN", "")).strip()
 DEBUG_MODE = str(os.getenv("DEBUG", "false")).lower() == "true"
 THINK_TAGS_MODE = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
 ANONYMOUS_MODE = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
+
+RAW_TOKEN_POOL = str(os.getenv("TOKEN_POOL", "")).strip()
+TOKEN_POOL_FAILURE_THRESHOLD = int(os.getenv("TOKEN_POOL_FAILURE_THRESHOLD", "3"))
+TOKEN_POOL_RESET_FAILURES = int(os.getenv("TOKEN_POOL_RESET_FAILURES", "1800"))
 
 # tiktoken 预加载
 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
@@ -39,6 +45,232 @@ BROWSER_HEADERS = {
 	"Origin": BASE,
 }
 
+def _parse_token_pool(raw: str) -> List[str]:
+	tokens: List[str] = []
+	if not raw:
+		return tokens
+	for candidate in re.split(r"[\n,]", raw):
+		token = candidate.strip()
+		if token:
+			tokens.append(token)
+	return tokens
+
+
+class TokenPool:
+	def __init__(self, tokens: Optional[List[str]] = None, failure_threshold: int = 3):
+		self._tokens: List[str] = []
+		self._lock = Lock()
+		self._index = 0
+		self._failure_threshold = max(1, failure_threshold)
+		self._failures: Dict[str, int] = {}
+		self._disabled: Dict[str, datetime] = {}
+		if tokens:
+			self.update(tokens)
+
+	def _available_tokens(self) -> List[str]:
+		now = datetime.now()
+		tokens: List[str] = []
+		for token in self._tokens:
+			disabled_at = self._disabled.get(token)
+			if disabled_at and (now - disabled_at).total_seconds() < TOKEN_POOL_RESET_FAILURES:
+				continue
+			tokens.append(token)
+		return tokens
+
+	def get(self) -> Optional[str]:
+		with self._lock:
+			available = self._available_tokens()
+			if not available:
+				self._disabled.clear()
+				available = self._available_tokens()
+			if not available:
+				return None
+			token = available[self._index % len(available)]
+			self._index = (self._index + 1) % len(available)
+			return token
+
+	def mark_success(self, token: Optional[str]):
+		if not token or token not in self._tokens:
+			return
+		with self._lock:
+			self._failures.pop(token, None)
+			self._disabled.pop(token, None)
+
+	def mark_failure(self, token: Optional[str]):
+		if not token or token not in self._tokens:
+			return
+		with self._lock:
+			count = self._failures.get(token, 0) + 1
+			self._failures[token] = count
+			if count >= self._failure_threshold:
+				self._disabled[token] = datetime.now()
+
+	def update(self, tokens: List[str]):
+		unique = []
+		seen = set()
+		for token in tokens:
+			if token and token not in seen:
+				unique.append(token)
+				seen.add(token)
+		with self._lock:
+			self._tokens = unique
+			self._index = 0
+			for token in list(self._failures.keys()):
+				if token not in self._tokens:
+					self._failures.pop(token, None)
+					self._disabled.pop(token, None)
+
+	def contains(self, token: Optional[str]) -> bool:
+		return bool(token and token in self._tokens)
+
+
+TOKEN_POOL_TOKENS = _parse_token_pool(RAW_TOKEN_POOL)
+if TOKEN and TOKEN not in TOKEN_POOL_TOKENS:
+	TOKEN_POOL_TOKENS.append(TOKEN)
+
+token_pool = TokenPool(TOKEN_POOL_TOKENS, TOKEN_POOL_FAILURE_THRESHOLD)
+
+
+MODEL_ID_ALIAS_SOURCE: Dict[str, str] = {
+        "glm-4.5v": "GLM-4.5V",
+        "0727-106B-API": "GLM-4.5-Air",
+        "0727-360B-API": "GLM-4.5",
+        "0808-360B-DR": "0808-360b-Dr",
+        "deep-research": "Z1-Rumination",
+        "GLM-4-6-API-V1": "GLM-4.6",
+        "glm-4-flash": "GLM-4-Flash",
+        "GLM-4.1V-Thinking-FlashX": "GLM-4.1V-Thinking-FlashX",
+        "main_chat": "GLM-4-32B",
+        "zero": "Z1-32B",
+}
+
+MODEL_ID_ALIASES: Dict[str, str] = {}
+for key, value in MODEL_ID_ALIAS_SOURCE.items():
+        MODEL_ID_ALIASES[key] = value
+        MODEL_ID_ALIASES[key.lower()] = value
+
+
+BASE_MODEL_VARIANT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+        "GLM-4.5": {
+                "upstream_id": "0727-360B-API",
+                "description": "标准模型，通用对话，平衡性能",
+                "thinking_description": "思考模型，显示推理过程，透明度高",
+                "search_description": "搜索模型，实时网络搜索，信息更新",
+        },
+        "GLM-4.5V": {
+                "upstream_id": "glm-4.5v",
+                "description": "视觉模型，支持多模态理解",
+        },
+        "GLM-4.5-Air": {
+                "upstream_id": "0727-106B-API",
+                "description": "轻量模型，优先响应速度",
+        },
+        "0808-360b-Dr": {
+                "upstream_id": "0808-360B-DR",
+                "description": "深度研究模型，适合长文本",
+        },
+        "Z1-Rumination": {
+                "upstream_id": "deep-research",
+                "description": "Z1 深度推理模型",
+                "default_features": {
+                        "enable_thinking": True,
+                        "web_search": True,
+                        "auto_web_search": True,
+                },
+                "search_description": "Z1 深度推理模型（增强搜索）",
+        },
+        "GLM-4.6": {
+                "upstream_id": "GLM-4-6-API-V1",
+                "description": "GLM 4.6 标准模型",
+        },
+        "GLM-4-Flash": {
+                "upstream_id": "glm-4-flash",
+                "description": "Flash 模型，追求快速响应",
+        },
+        "GLM-4.1V-Thinking-FlashX": {
+                "upstream_id": "GLM-4.1V-Thinking-FlashX",
+                "description": "视觉 FlashX 模型",
+                "default_features": {
+                        "enable_thinking": True,
+                },
+        },
+        "GLM-4-32B": {
+                "upstream_id": "main_chat",
+                "description": "32B 规格的通用模型",
+        },
+        "Z1-32B": {
+                "upstream_id": "zero",
+                "description": "Z1 32B 规格模型",
+        },
+}
+
+DEFAULT_VARIANT_FEATURES: Dict[str, Any] = {
+        "enable_thinking": False,
+        "web_search": False,
+        "auto_web_search": False,
+}
+
+DEFAULT_SEARCH_MCP_SERVERS = ["deep-web-search"]
+
+
+def _build_model_variant_config(definitions: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        config: Dict[str, Dict[str, Any]] = {}
+        for alias, meta in definitions.items():
+                upstream_id = meta.get("upstream_id")
+                if not upstream_id:
+                        continue
+
+                base_features = dict(DEFAULT_VARIANT_FEATURES)
+                base_features.update(meta.get("default_features", {}))
+
+                base_mcp_servers = meta.get("mcp_servers")
+                if base_mcp_servers is None:
+                        base_mcp_servers = []
+
+                base_entry = {
+                        "upstream_id": upstream_id,
+                        "description": meta.get("description") or f"{alias} 标准模型",
+                        "features": base_features,
+                        "mcp_servers": list(base_mcp_servers),
+                }
+                if base_entry["features"].get("web_search") and not base_entry["mcp_servers"]:
+                        base_entry["mcp_servers"] = list(DEFAULT_SEARCH_MCP_SERVERS)
+                config[alias] = base_entry
+
+                thinking_features = dict(base_features)
+                thinking_features["enable_thinking"] = True
+
+                thinking_mcp_servers = meta.get("thinking_mcp_servers")
+                if thinking_mcp_servers is None:
+                        thinking_mcp_servers = base_entry["mcp_servers"]
+
+                config[f"{alias}-Thinking"] = {
+                        "upstream_id": upstream_id,
+                        "description": meta.get("thinking_description") or f"{alias} 思考模型",
+                        "features": thinking_features,
+                        "mcp_servers": list(thinking_mcp_servers),
+                }
+
+                search_features = dict(base_features)
+                search_features["web_search"] = True
+                search_features["auto_web_search"] = True
+
+                search_mcp_servers = meta.get("search_mcp_servers")
+                if search_mcp_servers is None:
+                        search_mcp_servers = DEFAULT_SEARCH_MCP_SERVERS
+
+                config[f"{alias}-Search"] = {
+                        "upstream_id": upstream_id,
+                        "description": meta.get("search_description") or f"{alias} 搜索模型",
+                        "features": search_features,
+                        "mcp_servers": list(search_mcp_servers),
+                }
+
+        return config
+
+
+MODEL_VARIANT_CONFIG = _build_model_variant_config(BASE_MODEL_VARIANT_DEFINITIONS)
+
 # 日志
 logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger(__name__)
@@ -57,7 +289,28 @@ class utils:
 		@staticmethod
 		def chat(data, chat_id):
 			debug("收到请求: %s", json.dumps(data))
-			return requests.post(f"{BASE}/api/chat/completions", json=data, headers={**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}", "Referer": f"{BASE}/c/{chat_id}"}, stream=True, timeout=60)
+			token = utils.request.token()
+			headers = {**BROWSER_HEADERS, "Referer": f"{BASE}/c/{chat_id}"}
+			if token:
+				headers["Authorization"] = f"Bearer {token}"
+			try:
+				response = requests.post(
+					f"{BASE}/api/chat/completions",
+					json=data,
+					headers=headers,
+					stream=True,
+					timeout=60
+				)
+				if token_pool.contains(token):
+					if response.status_code in (401, 403):
+						token_pool.mark_failure(token)
+					else:
+						token_pool.mark_success(token)
+				return response
+			except Exception as e:
+				if token_pool.contains(token):
+					token_pool.mark_failure(token)
+				raise e
 		@staticmethod
 		def image(data_url, chat_id):
 			try:
@@ -71,7 +324,23 @@ class utils:
 				filename = str(uuid.uuid4())
 
 				debug("上传文件：%s", filename)
-				response = requests.post(f"{BASE}/api/v1/files/", files={"file": (filename, image_data, mime_type)}, headers={**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}", "Referer": f"{BASE}/c/{chat_id}"}, timeout=30)
+				token = utils.request.token(prefer_pool=True)
+				headers = {**BROWSER_HEADERS, "Referer": f"{BASE}/c/{chat_id}"}
+				if token:
+					headers["Authorization"] = f"Bearer {token}"
+
+				response = requests.post(
+					f"{BASE}/api/v1/files/",
+					files={"file": (filename, image_data, mime_type)},
+					headers=headers,
+					timeout=30
+				)
+
+				if token_pool.contains(token):
+					if response.status_code in (401, 403):
+						token_pool.mark_failure(token)
+					else:
+						token_pool.mark_success(token)
 
 				if response.status_code == 200:
 					result = response.json()
@@ -85,8 +354,19 @@ class utils:
 		def id(prefix = "msg") -> str:
 			return f"{prefix}-{int(datetime.now().timestamp()*1e9)}"
 		@staticmethod
-		def token() -> str:
-			if not ANONYMOUS_MODE: return TOKEN
+		def token(prefer_pool: bool = True) -> str:
+			token: Optional[str] = None
+
+			if prefer_pool:
+				token = token_pool.get()
+				if token:
+					debug("使用池中令牌: %s...", token[:10])
+					return token
+
+			if not ANONYMOUS_MODE:
+				if TOKEN:
+					return TOKEN
+
 			try:
 				r = requests.get(f"{BASE}/api/v1/auths/", headers=BROWSER_HEADERS, timeout=8)
 				token = r.json().get("token")
@@ -231,24 +511,70 @@ def models():
 			"""判断是否是英文字符 (A-Z / a-z)"""
 			return 'A' <= ch <= 'Z' or 'a' <= ch <= 'z'
 
-		headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}"}
-		r = requests.get(f"{BASE}/api/models", headers=headers, timeout=8).json()
-		models = []
-		for m in r.get("data", []):
-			if not m.get("info", {}).get("is_active", True):
-				continue
-			model_id, model_name = m.get("id"), m.get("name")
-			if model_id.startswith(("GLM", "Z")):
-				model_name = model_id
-			if not model_name or not is_english_letter(model_name[0]):
-				model_name = format_model_name(model_id)
-			models.append({
-				"id": model_id,
-				"object": "model",
-				"name": model_name,
-				"created": m.get("info", {}).get("created_at", int(datetime.now().timestamp())),
-				"owned_by": "z.ai"
-			})
+			token = utils.request.token()
+			headers = {**BROWSER_HEADERS}
+			if token:
+				headers["Authorization"] = f"Bearer {token}"
+
+			response = requests.get(f"{BASE}/api/models", headers=headers, timeout=8)
+			if token_pool.contains(token):
+				if response.status_code in (401, 403):
+					token_pool.mark_failure(token)
+				else:
+					token_pool.mark_success(token)
+
+			r = response.json()
+			models = []
+			existing_ids = set()
+			upstream_created_map: Dict[str, int] = {}
+
+			for m in r.get("data", []):
+				if not m.get("info", {}).get("is_active", True):
+					continue
+				model_id, model_name = m.get("id"), m.get("name")
+				alias_name = MODEL_ID_ALIASES.get(model_id) if model_id else None
+				if alias_name:
+					model_name = alias_name
+				elif model_id and model_id.startswith(("GLM", "Z")):
+					model_name = model_id
+				if not model_name or not is_english_letter(model_name[0]):
+					model_name = format_model_name(model_id)
+				created_at = m.get("info", {}).get("created_at", int(datetime.now().timestamp()))
+				upstream_created_map[model_id] = created_at
+
+				entry = {
+					"id": model_id,
+					"object": "model",
+					"name": model_name,
+					"created": created_at,
+					"owned_by": "z.ai"
+				}
+				models.append(entry)
+				existing_ids.add(entry["id"])
+
+			for variant_name, config in MODEL_VARIANT_CONFIG.items():
+				upstream_id = config.get("upstream_id")
+				if upstream_id and upstream_id not in upstream_created_map:
+					continue
+				if variant_name in existing_ids:
+					continue
+
+				metadata = {
+					"upstream_id": upstream_id,
+					"features": config.get("features", {}),
+					"mcp_servers": config.get("mcp_servers", [])
+				}
+				entry = {
+					"id": variant_name,
+					"object": "model",
+					"name": variant_name,
+					"created": upstream_created_map.get(upstream_id, int(datetime.now().timestamp())),
+					"owned_by": "z.ai",
+					"description": config.get("description", ""),
+					"metadata": metadata
+				}
+				models.append(entry)
+				existing_ids.add(variant_name)
 		return utils.request.response(jsonify({"object":"list","data":models}))
 	except Exception as e:
 		debug("模型列表失败: %s", e)
@@ -260,12 +586,58 @@ def OpenAI_Compatible():
 	odata = request.get_json(force=True, silent=True) or {}
 
 	id = utils.request.id("chat")
-	model = odata.get("model", MODEL)
+	requested_model = (odata.get("model") or MODEL or "").strip() or MODEL
+	normalized_model = requested_model
+	for variant in MODEL_VARIANT_CONFIG:
+		if variant.lower() == requested_model.lower():
+			normalized_model = variant
+			break
+
+	variant_config = MODEL_VARIANT_CONFIG.get(normalized_model)
+	upstream_model = variant_config.get("upstream_id") if variant_config else normalized_model
+	model = normalized_model if variant_config else requested_model
 	messages = odata.get("messages", [])
-	features = odata.get("features", { "enable_thinking": True })
+	raw_features = odata.get("features")
+	features: Dict[str, Any] = {
+		"image_generation": False,
+		"web_search": False,
+		"auto_web_search": False,
+		"preview_mode": False,
+		"flags": [],
+		"features": [],
+		"enable_thinking": True,
+	}
+	if isinstance(raw_features, dict):
+		for key, value in raw_features.items():
+			features[key] = value
+	if variant_config:
+		for key, value in variant_config.get("features", {}).items():
+			features[key] = value
+
+	reasoning_flag = odata.get("reasoning")
+	if isinstance(reasoning_flag, bool):
+		features["enable_thinking"] = reasoning_flag
+
+	for bool_key in ("enable_thinking", "web_search", "auto_web_search", "image_generation", "preview_mode"):
+		if bool_key in features:
+			features[bool_key] = bool(features[bool_key])
+
+	for list_key in ("flags", "features"):
+		if list_key in features and not isinstance(features[list_key], list):
+			features[list_key] = []
+
 	stream = odata.get("stream", False)
 	include_usage = stream and odata.get("stream_options", {}).get("include_usage", False)
 
+	mcp_servers: List[str] = []
+	if isinstance(odata.get("mcp_servers"), list):
+		for server in odata.get("mcp_servers"):
+			if isinstance(server, str) and server not in mcp_servers:
+				mcp_servers.append(server)
+	if variant_config:
+		for server in variant_config.get("mcp_servers", []):
+			if server not in mcp_servers:
+				mcp_servers.append(server)
 	for message in messages:
 		if isinstance(message.get("content"), list):
 			for content_item in message["content"]:
@@ -277,14 +649,19 @@ def OpenAI_Compatible():
 							content_item["image_url"]["url"] = file_url # 上传后的图片链接
 
 	data = {
-		**odata, 
+		**odata,
 		"stream": True,
 		"chat_id": id,
 		"id": utils.request.id(),
-		"model": model,
+		"model": upstream_model,
 		"messages": messages,
 		"features": features
 	}
+
+	if mcp_servers:
+		data["mcp_servers"] = mcp_servers
+
+	data.setdefault("model_item", {"id": upstream_model, "name": model, "owned_by": "z.ai"})
 
 	try:
 		response = utils.request.chat(data, id)
