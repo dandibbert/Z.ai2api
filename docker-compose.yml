@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  zai2api:
+    build: .
+    container_name: zai2api
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8080}:8080"
+    volumes:
+      - zai2api-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  zai2api-data:
+    driver: local
