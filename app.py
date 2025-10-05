@@ -105,14 +105,6 @@ BROWSER_HEADERS = {
 }
 
 
-def _shorten_token(token: str, head: int = 4, tail: int = 4) -> str:
-        if not token:
-                return ""
-        if len(token) <= head + tail + 3:
-                return token
-        return f"{token[:head]}...{token[-tail:]}"
-
-
 def _client_ip() -> str:
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
@@ -260,9 +252,10 @@ class TokenPool:
                                         remaining = TOKEN_POOL_RESET_FAILURES - elapsed
                                         if remaining > 0:
                                                 cooldown_seconds = int(max(0, round(remaining)))
+                                token_id = _token_identifier(token)
                                 items.append({
-                                        "token_id": _token_identifier(token),
-                                        "display": _shorten_token(token),
+                                        "token_id": token_id,
+                                        "display": _token_display_from_id(token_id),
                                         "index": idx,
                                         "failures": self._failures.get(token, 0),
                                         "successes": self._successes.get(token, 0),
@@ -297,6 +290,12 @@ def _token_identifier(token: str) -> str:
                 token.encode("utf-8"),
                 hashlib.sha256,
         ).hexdigest()
+
+
+def _token_display_from_id(token_id: str) -> str:
+        if not token_id:
+                return "token"
+        return f"token:{token_id[:8]}"
 
 
 TOKEN_POOL_TOKENS = _parse_token_pool(RAW_TOKEN_POOL)
@@ -338,8 +337,8 @@ class RequestMetrics:
                         token_display = "匿名 token"
                         token_id = None
                 elif token_source == "pool" or token_source == "static":
-                        token_display = _shorten_token(token_value)
                         token_id = _token_identifier(token_value)
+                        token_display = _token_display_from_id(token_id)
                 else:
                         token_display = token_value or ""
 
@@ -461,7 +460,25 @@ def _finalize_upstream_response(response, *, error: Optional[str] = None):
                         token_pool.mark_failure(token)
 
 
-def _has_valid_auth() -> bool:
+def _has_dashboard_session() -> bool:
+        if not AUTH_TOKEN:
+                return True
+        return bool(session.get("authenticated"))
+
+
+def _establish_dashboard_session():
+        session.clear()
+        session.permanent = False
+        session["authenticated"] = True
+        session.modified = True
+
+
+def _clear_dashboard_session():
+        session.clear()
+        session.modified = True
+
+
+def _has_valid_api_auth() -> bool:
         if not AUTH_TOKEN:
                 return True
         if session.get("authenticated"):
@@ -481,7 +498,14 @@ def _has_valid_auth() -> bool:
 
 
 def _require_api_auth():
-        if _has_valid_auth():
+        if _has_valid_api_auth():
+                return None
+        response = jsonify({"error": "unauthorized"})
+        return utils.request.response(make_response(response, 401))
+
+
+def _require_dashboard_auth():
+        if _has_dashboard_session():
                 return None
         response = jsonify({"error": "unauthorized"})
         return utils.request.response(make_response(response, 401))
@@ -688,16 +712,19 @@ DASHBOARD_TEMPLATE = """
             display: flex;
             gap: 12px;
             flex-wrap: wrap;
+            align-items: flex-start;
         }
-        form#add-token-form input {
-            flex: 1;
-            min-width: 220px;
+        form#add-token-form textarea {
+            flex: 1 1 320px;
+            min-height: 96px;
             padding: 10px 14px;
             border-radius: 10px;
             border: 1px solid var(--border);
             background: rgba(15, 23, 42, 0.65);
             color: var(--text);
             font-size: 14px;
+            resize: vertical;
+            line-height: 1.5;
         }
         .help-text { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
         @media (max-width: 768px) {
@@ -705,7 +732,7 @@ DASHBOARD_TEMPLATE = """
             header { flex-direction: column; align-items: flex-start; }
             .section-header { flex-direction: column; align-items: flex-start; }
             form#add-token-form { width: 100%; }
-            form#add-token-form input { width: 100%; }
+            form#add-token-form textarea { width: 100%; }
         }
     </style>
 </head>
@@ -772,7 +799,7 @@ DASHBOARD_TEMPLATE = """
             <div class=\"section-header\">
                 <h2>Token 管理</h2>
                 <form id=\"add-token-form\">
-                    <input id=\"new-token\" name=\"token\" placeholder=\"粘贴新 Token\" autocomplete=\"off\" required />
+                    <textarea id=\"new-token\" name=\"token\" placeholder=\"粘贴新 Token（支持逗号或换行批量添加）\" autocomplete=\"off\" required spellcheck=\"false\"></textarea>
                     <button type=\"submit\">添加 Token</button>
                 </form>
             </div>
@@ -817,6 +844,14 @@ DASHBOARD_TEMPLATE = """
         };
 
         function renderRequests(list) {
+            if (!Array.isArray(list) || list.length === 0) {
+                requestsBody.innerHTML = `
+                    <tr>
+                        <td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">暂无请求</td>
+                    </tr>
+                `;
+                return;
+            }
             requestsBody.innerHTML = list.map(item => `
                 <tr>
                     <td>${escapeHtml(item.timestamp)}</td>
@@ -833,13 +868,15 @@ DASHBOARD_TEMPLATE = """
         function buildTokenRows(tokenStats, tokenPool) {
             const rows = [];
             const statsMap = new Map();
-            tokenStats.forEach(item => {
+            const statsArray = Array.isArray(tokenStats) ? tokenStats : [];
+            statsArray.forEach(item => {
                 const key = item.token_id || `__${item.source}__`;
                 statsMap.set(key, item);
             });
 
             const seen = new Set();
-            tokenPool.tokens.forEach(item => {
+            const poolTokens = tokenPool && Array.isArray(tokenPool.tokens) ? tokenPool.tokens : [];
+            poolTokens.forEach(item => {
                 const stat = statsMap.get(item.token_id) || { display: item.display, source: 'pool', success: 0, failure: 0 };
                 rows.push({
                     token_id: item.token_id,
@@ -886,6 +923,14 @@ DASHBOARD_TEMPLATE = """
 
         function renderTokens(tokenStats, tokenPool) {
             const rows = buildTokenRows(tokenStats, tokenPool);
+            if (!rows.length) {
+                tokensBody.innerHTML = `
+                    <tr>
+                        <td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">暂无令牌</td>
+                    </tr>
+                `;
+                return;
+            }
             tokensBody.innerHTML = rows.map(item => {
                 const status = item.source === 'anonymous' ? '匿名' : (item.disabled ? '禁用' : '活跃');
                 const actionButton = item.token_id ? `<button type=\"button\" class=\"ghost\" data-token-id=\"${escapeHtml(item.token_id)}\">移除</button>` : '';
@@ -914,20 +959,30 @@ DASHBOARD_TEMPLATE = """
         }
 
         async function fetchOverview() {
-            const res = await fetch('/dashboard/api/overview', { credentials: 'same-origin' });
-            if (res.status === 401) {
-                window.location.reload();
-                return;
+            try {
+                const res = await fetch('/dashboard/api/overview', { credentials: 'same-origin' });
+                if (res.status === 401) {
+                    window.location.href = '/dashboard';
+                    return;
+                }
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                const data = await res.json();
+                totalEl.textContent = data.stats.total_requests;
+                successEl.textContent = data.stats.success_requests;
+                failureEl.textContent = data.stats.failure_requests;
+                averageEl.textContent = data.stats.average_response_time;
+                modeIndicator.textContent = data.anonymous_mode ? '匿名模式' : '非匿名模式';
+                renderRequests(data.recent_requests);
+                renderTokens(data.token_stats, data.token_pool);
+                lastUpdated.textContent = `更新于 ${new Date().toLocaleTimeString()}`;
+            } catch (err) {
+                console.error('刷新仪表盘失败', err);
+                lastUpdated.textContent = '刷新失败，稍后自动重试';
+                renderRequests([]);
+                renderTokens([], { tokens: [] });
             }
-            const data = await res.json();
-            totalEl.textContent = data.stats.total_requests;
-            successEl.textContent = data.stats.success_requests;
-            failureEl.textContent = data.stats.failure_requests;
-            averageEl.textContent = data.stats.average_response_time;
-            modeIndicator.textContent = data.anonymous_mode ? '匿名模式' : '非匿名模式';
-            renderRequests(data.recent_requests);
-            renderTokens(data.token_stats, data.token_pool);
-            lastUpdated.textContent = `更新于 ${new Date().toLocaleTimeString()}`;
         }
 
         autoRefreshToggle.addEventListener('change', (event) => {
@@ -946,18 +1001,29 @@ DASHBOARD_TEMPLATE = """
 
         addTokenForm.addEventListener('submit', async (event) => {
             event.preventDefault();
-            const tokens = newTokenInput.value.split(/[\n,]/).map(item => item.trim()).filter(Boolean);
+            const tokens = newTokenInput.value
+                .split(/[\r\n,]+/)
+                .map(item => item.trim())
+                .filter(Boolean);
             if (!tokens.length) return;
-            const res = await fetch('/dashboard/api/tokens', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'same-origin',
-                body: JSON.stringify({ tokens }),
-            });
-            if (res.ok) {
+            try {
+                const res = await fetch('/dashboard/api/tokens', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ tokens }),
+                });
+                if (res.status === 401) {
+                    window.location.href = '/dashboard';
+                    return;
+                }
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
                 newTokenInput.value = '';
                 fetchOverview();
-            } else {
+            } catch (err) {
+                console.error('添加 Token 失败', err);
                 alert('添加失败，请检查日志');
             }
         });
@@ -967,23 +1033,34 @@ DASHBOARD_TEMPLATE = """
             if (!button) return;
             const tokenId = button.getAttribute('data-token-id');
             if (!confirm('确认移除该 Token 吗？')) return;
-            const res = await fetch('/dashboard/api/tokens', {
-                method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'same-origin',
-                body: JSON.stringify({ token_id: tokenId }),
-            });
-            if (res.ok) {
+            try {
+                const res = await fetch('/dashboard/api/tokens', {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ token_id: tokenId }),
+                });
+                if (res.status === 401) {
+                    window.location.href = '/dashboard';
+                    return;
+                }
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
                 fetchOverview();
-            } else {
+            } catch (err) {
+                console.error('移除 Token 失败', err);
                 alert('移除失败，请重试');
             }
         });
 
         if (logoutBtn) {
             logoutBtn.addEventListener('click', async () => {
-                await fetch('/dashboard/logout', { method: 'POST', credentials: 'same-origin' });
-                window.location.reload();
+                try {
+                    await fetch('/dashboard/logout', { method: 'POST', credentials: 'same-origin' });
+                } finally {
+                    window.location.href = '/dashboard';
+                }
             });
         }
 
@@ -1939,14 +2016,14 @@ def dashboard():
         error = None
         if request.method == "POST":
                 if not AUTH_TOKEN:
-                        session["authenticated"] = True
+                        _establish_dashboard_session()
                         return redirect(url_for("dashboard"))
                 password = (request.form.get("password") or "").strip()
                 if password == AUTH_TOKEN:
-                        session["authenticated"] = True
+                        _establish_dashboard_session()
                         return redirect(url_for("dashboard"))
                 error = "密码错误，请重试。"
-        if not _has_valid_auth():
+        if not _has_dashboard_session():
                 return render_template_string(
                         DASHBOARD_LOGIN_TEMPLATE,
                         error=error,
@@ -1957,13 +2034,16 @@ def dashboard():
 
 @app.route("/dashboard/logout", methods=["POST"])
 def dashboard_logout():
-        session.pop("authenticated", None)
-        return utils.request.response(jsonify({"ok": True}))
+        _clear_dashboard_session()
+        response = jsonify({"ok": True})
+        flask_response = make_response(response)
+        flask_response.delete_cookie(app.config.get("SESSION_COOKIE_NAME", app.session_cookie_name))
+        return utils.request.response(flask_response)
 
 
 @app.route("/dashboard/api/overview", methods=["GET"])
 def dashboard_overview():
-        auth_error = _require_api_auth()
+        auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
         metrics_snapshot = request_metrics.snapshot()
@@ -1985,7 +2065,7 @@ def dashboard_overview():
 
 @app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE"])
 def dashboard_tokens():
-        auth_error = _require_api_auth()
+        auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
         if request.method == "GET":
