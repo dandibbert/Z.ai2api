@@ -5,7 +5,7 @@ Z.ai 2 API
 基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 使用 AI 辅助重构。
 """
 
-import os, json, re, requests, logging, uuid, base64, time
+import os, json, re, requests, logging, uuid, base64, time, hashlib, hmac
 from collections import defaultdict, deque
 from datetime import datetime
 from threading import Lock
@@ -57,25 +57,32 @@ def _ensure_state_dir():
                 logging.getLogger(__name__).warning("无法创建状态目录: %s", STATE_DIR)
 
 
-def _load_persisted_tokens() -> List[str]:
+def _load_persisted_state() -> Dict[str, Any]:
         try:
                 with open(TOKEN_POOL_STATE_FILE, "r", encoding="utf-8") as fh:
                         payload = json.load(fh)
                         tokens = payload.get("tokens", [])
                         if isinstance(tokens, list):
-                                return [str(token).strip() for token in tokens if str(token).strip()]
+                                payload["tokens"] = [
+                                        str(token).strip() for token in tokens if str(token).strip()
+                                ]
+                        else:
+                                payload["tokens"] = []
+                        if not isinstance(payload.get("salt"), str):
+                                payload["salt"] = ""
+                        return payload
         except FileNotFoundError:
-                return []
+                return {"tokens": [], "salt": ""}
         except Exception as exc:
                 logging.getLogger(__name__).warning("读取持久化 token 池失败: %s", exc)
-        return []
+        return {"tokens": [], "salt": ""}
 
 
 def _persist_token_pool(tokens: List[str]):
         try:
                 _ensure_state_dir()
                 with open(TOKEN_POOL_STATE_FILE, "w", encoding="utf-8") as fh:
-                        json.dump({"tokens": tokens}, fh, ensure_ascii=False, indent=2)
+                        json.dump({"tokens": tokens, "salt": TOKEN_HASH_SECRET}, fh, ensure_ascii=False, indent=2)
         except Exception as exc:
                 logging.getLogger(__name__).warning("写入持久化 token 池失败: %s", exc)
 
@@ -163,6 +170,7 @@ class TokenPool:
                 self._failures: Dict[str, int] = {}
                 self._disabled: Dict[str, datetime] = {}
                 self._successes: Dict[str, int] = {}
+                self._token_ids: Dict[str, str] = {}
                 if tokens:
                         self.update(tokens)
 
@@ -216,6 +224,7 @@ class TokenPool:
                 with self._lock:
                         self._tokens = unique
                         self._index = 0
+                        self._token_ids = {_token_identifier(token): token for token in self._tokens}
                         for token in list(self._failures.keys()):
                                 if token not in self._tokens:
                                         self._failures.pop(token, None)
@@ -232,6 +241,12 @@ class TokenPool:
                 with self._lock:
                         return list(self._tokens)
 
+        def resolve_id(self, token_id: str) -> Optional[str]:
+                if not token_id:
+                        return None
+                with self._lock:
+                        return self._token_ids.get(token_id)
+
         def snapshot(self) -> Dict[str, Any]:
                 with self._lock:
                         now = datetime.now()
@@ -246,7 +261,7 @@ class TokenPool:
                                         if remaining > 0:
                                                 cooldown_seconds = int(max(0, round(remaining)))
                                 items.append({
-                                        "token": token,
+                                        "token_id": _token_identifier(token),
                                         "display": _shorten_token(token),
                                         "index": idx,
                                         "failures": self._failures.get(token, 0),
@@ -262,9 +277,30 @@ class TokenPool:
                         }
 
 
+persisted_state = _load_persisted_state()
+_persisted_tokens = persisted_state.get("tokens", [])
+_persisted_salt = persisted_state.get("salt", "")
+
+TOKEN_HASH_SECRET = (
+        str(os.getenv("TOKEN_HASH_SECRET", "")).strip()
+        or (_persisted_salt if isinstance(_persisted_salt, str) else "")
+)
+if not TOKEN_HASH_SECRET:
+        TOKEN_HASH_SECRET = base64.urlsafe_b64encode(os.urandom(24)).decode("utf-8").rstrip("=")
+
+
+def _token_identifier(token: str) -> str:
+        if not token:
+                return ""
+        return hmac.new(
+                TOKEN_HASH_SECRET.encode("utf-8"),
+                token.encode("utf-8"),
+                hashlib.sha256,
+        ).hexdigest()
+
+
 TOKEN_POOL_TOKENS = _parse_token_pool(RAW_TOKEN_POOL)
-persisted_tokens = _load_persisted_tokens()
-for token in persisted_tokens:
+for token in _persisted_tokens:
         if token not in TOKEN_POOL_TOKENS:
                 TOKEN_POOL_TOKENS.append(token)
 if TOKEN and TOKEN not in TOKEN_POOL_TOKENS:
@@ -293,18 +329,21 @@ class RequestMetrics:
                 success = status_code is not None and 200 <= status_code < 400
                 token_source = "none"
                 token_value = None
+                token_id = None
                 token_display = ""
                 if token_info:
                         token_source = token_info.get("source", "none")
                         token_value = token_info.get("token")
                 if token_source == "anonymous" or not token_value:
                         token_display = "匿名 token"
+                        token_id = None
                 elif token_source == "pool" or token_source == "static":
                         token_display = _shorten_token(token_value)
+                        token_id = _token_identifier(token_value)
                 else:
                         token_display = token_value or ""
 
-                key = token_value if token_value else f"__{token_source}__"
+                key = token_id if token_id else f"__{token_source}__"
                 with self._lock:
                         self._total_requests += 1
                         self._total_response_time += duration
@@ -315,6 +354,8 @@ class RequestMetrics:
                                 self._failure_requests += 1
                                 self._token_stats[key]["failure"] += 1
                         self._token_stats[key]["source"] = token_source
+                        if token_display:
+                                self._token_stats[key]["display"] = token_display
 
                         entry = {
                                 "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -337,16 +378,16 @@ class RequestMetrics:
                         recent = list(self._recent_requests)
                         token_stats = []
                         for key, stats in self._token_stats.items():
-                                token_value = key if not key.startswith("__") else None
+                                token_id = key if not key.startswith("__") else None
                                 source = stats.get("source", "unknown")
-                                if not token_value and source == "anonymous":
+                                if not token_id and source == "anonymous":
                                         display = "匿名 token"
-                                elif token_value:
-                                        display = _shorten_token(token_value)
+                                elif token_id:
+                                        display = stats.get("display") or "Token"
                                 else:
                                         display = source
                                 token_stats.append({
-                                        "token": token_value,
+                                        "token_id": token_id,
                                         "display": display,
                                         "source": source,
                                         "success": stats.get("success", 0),
@@ -793,15 +834,15 @@ DASHBOARD_TEMPLATE = """
             const rows = [];
             const statsMap = new Map();
             tokenStats.forEach(item => {
-                const key = item.token || `__${item.source}__`;
+                const key = item.token_id || `__${item.source}__`;
                 statsMap.set(key, item);
             });
 
             const seen = new Set();
             tokenPool.tokens.forEach(item => {
-                const stat = statsMap.get(item.token) || { display: item.display, source: 'pool', success: 0, failure: 0 };
+                const stat = statsMap.get(item.token_id) || { display: item.display, source: 'pool', success: 0, failure: 0 };
                 rows.push({
-                    token: item.token,
+                    token_id: item.token_id,
                     display: item.display,
                     source: stat.source || 'pool',
                     success: stat.success || 0,
@@ -809,14 +850,14 @@ DASHBOARD_TEMPLATE = """
                     disabled: !!item.disabled,
                     cooldown: item.cooldown_seconds || 0,
                 });
-                seen.add(item.token);
+                seen.add(item.token_id);
             });
 
             statsMap.forEach((stat, key) => {
                 if (key.startsWith('__')) {
                     if (stat.source === 'anonymous') {
                         rows.push({
-                            token: null,
+                            token_id: null,
                             display: stat.display || '匿名 token',
                             source: 'anonymous',
                             success: stat.success || 0,
@@ -829,7 +870,7 @@ DASHBOARD_TEMPLATE = """
                 }
                 if (!seen.has(key)) {
                     rows.push({
-                        token: key,
+                        token_id: key,
                         display: stat.display || 'Token',
                         source: stat.source || 'static',
                         success: stat.success || 0,
@@ -847,10 +888,10 @@ DASHBOARD_TEMPLATE = """
             const rows = buildTokenRows(tokenStats, tokenPool);
             tokensBody.innerHTML = rows.map(item => {
                 const status = item.source === 'anonymous' ? '匿名' : (item.disabled ? '禁用' : '活跃');
-                const actionButton = item.token ? `<button type=\"button\" class=\"ghost\" data-token=\"${escapeHtml(item.token)}\">移除</button>` : '';
+                const actionButton = item.token_id ? `<button type=\"button\" class=\"ghost\" data-token-id=\"${escapeHtml(item.token_id)}\">移除</button>` : '';
                 return `
                     <tr>
-                        <td title="${item.token ? escapeHtml(item.token) : ''}">${escapeHtml(item.display)}</td>
+                        <td>${escapeHtml(item.display)}</td>
                         <td>${escapeHtml(item.source)}</td>
                         <td>${item.success}</td>
                         <td>${item.failure}</td>
@@ -922,15 +963,15 @@ DASHBOARD_TEMPLATE = """
         });
 
         tokensBody.addEventListener('click', async (event) => {
-            const button = event.target.closest('button[data-token]');
+            const button = event.target.closest('button[data-token-id]');
             if (!button) return;
-            const token = button.getAttribute('data-token');
+            const tokenId = button.getAttribute('data-token-id');
             if (!confirm('确认移除该 Token 吗？')) return;
             const res = await fetch('/dashboard/api/tokens', {
                 method: 'DELETE',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
-                body: JSON.stringify({ token }),
+                body: JSON.stringify({ token_id: tokenId }),
             });
             if (res.ok) {
                 fetchOverview();
@@ -1956,16 +1997,31 @@ def dashboard_tokens():
                 }))
 
         data = request.get_json(force=True, silent=True) or {}
-        tokens_payload = data.get("tokens")
-        token_value = data.get("token")
-        token_inputs = _normalize_token_inputs(tokens_payload if tokens_payload is not None else token_value)
-        if not token_inputs:
+        token_inputs: List[str] = []
+        for value in (data.get("tokens"), data.get("token")):
+                token_inputs.extend(_normalize_token_inputs(value))
+        token_id_inputs: List[str] = []
+        for value in (data.get("token_ids"), data.get("token_id")):
+                token_id_inputs.extend(_normalize_token_inputs(value))
+
+        resolved_tokens: List[str] = []
+        for identifier in token_id_inputs:
+                resolved = token_pool.resolve_id(identifier)
+                if resolved and resolved not in resolved_tokens:
+                        resolved_tokens.append(resolved)
+
+        if request.method == "POST":
+                effective_tokens = list(dict.fromkeys(token_inputs))
+        else:
+                effective_tokens = list(dict.fromkeys(token_inputs + resolved_tokens))
+
+        if not effective_tokens:
                 return utils.request.response(make_response(jsonify({"error": "token required"}), 400))
 
         current_tokens = token_pool.tokens()
         if request.method == "POST":
                 updated = False
-                for candidate in token_inputs:
+                for candidate in effective_tokens:
                         if candidate not in current_tokens:
                                 current_tokens.append(candidate)
                                 updated = True
@@ -1980,7 +2036,7 @@ def dashboard_tokens():
                 }))
 
         removed = False
-        for candidate in token_inputs:
+        for candidate in effective_tokens:
                 if candidate in current_tokens:
                         current_tokens.remove(candidate)
                         removed = True
