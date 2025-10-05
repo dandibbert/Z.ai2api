@@ -1058,7 +1058,11 @@ DASHBOARD_TEMPLATE = """
             }
             event.preventDefault();
             const tokens = newTokenInput.value
-                .split(/[\n\r\t ,]+/)
+                .replace(/\\n/g, ' ')
+                .replace(/\\r/g, ' ')
+                .replace(/\\t/g, ' ')
+                .replace(/,/g, ' ')
+                .split(' ')
                 .map(item => item.trim())
                 .filter(Boolean);
             if (!tokens.length) return;
