@@ -483,102 +483,112 @@ class utils:
 # 路由
 @app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
 def models():
-	if request.method == "OPTIONS": return utils.request.response(make_response())
-	try:
-		def format_model_name(name: str) -> str:
-			"""格式化模型名:
-			- 单段: 全大写
-			- 多段: 第一段全大写, 后续段首字母大写
-			- 数字保持不变, 符号原样保留
-			"""
-			if not name: return ""
-			parts = name.split('-')
-			if len(parts) == 1:
-				return parts[0].upper()
-			formatted = [parts[0].upper()]
-			for p in parts[1:]:
-				if not p:
-					formatted.append("")
-				elif p.isdigit():
-					formatted.append(p)
-				elif any(c.isalpha() for c in p):
-					formatted.append(p.capitalize())
-				else:
-					formatted.append(p)
-			return "-".join(formatted)
+    if request.method == "OPTIONS":
+        return utils.request.response(make_response())
+    try:
+        def format_model_name(name: str) -> str:
+            """格式化模型名:
+            - 单段: 全大写
+            - 多段: 第一段全大写, 后续段首字母大写
+            - 数字保持不变, 符号原样保留
+            """
 
-		def is_english_letter(ch: str) -> bool:
-			"""判断是否是英文字符 (A-Z / a-z)"""
-			return 'A' <= ch <= 'Z' or 'a' <= ch <= 'z'
+            if not name:
+                return ""
 
-			token = utils.request.token()
-			headers = {**BROWSER_HEADERS}
-			if token:
-				headers["Authorization"] = f"Bearer {token}"
+            parts = name.split('-')
+            if len(parts) == 1:
+                return parts[0].upper()
 
-			response = requests.get(f"{BASE}/api/models", headers=headers, timeout=8)
-			if token_pool.contains(token):
-				if response.status_code in (401, 403):
-					token_pool.mark_failure(token)
-				else:
-					token_pool.mark_success(token)
+            formatted = [parts[0].upper()]
+            for p in parts[1:]:
+                if not p:
+                    formatted.append("")
+                elif p.isdigit():
+                    formatted.append(p)
+                elif any(c.isalpha() for c in p):
+                    formatted.append(p.capitalize())
+                else:
+                    formatted.append(p)
+            return "-".join(formatted)
 
-			r = response.json()
-			models = []
-			existing_ids = set()
-			upstream_created_map: Dict[str, int] = {}
+        def is_english_letter(ch: str) -> bool:
+            """判断是否是英文字符 (A-Z / a-z)"""
 
-			for m in r.get("data", []):
-				if not m.get("info", {}).get("is_active", True):
-					continue
-				model_id, model_name = m.get("id"), m.get("name")
-				alias_name = MODEL_ID_ALIASES.get(model_id) if model_id else None
-				if alias_name:
-					model_name = alias_name
-				elif model_id and model_id.startswith(("GLM", "Z")):
-					model_name = model_id
-				if not model_name or not is_english_letter(model_name[0]):
-					model_name = format_model_name(model_id)
-				created_at = m.get("info", {}).get("created_at", int(datetime.now().timestamp()))
-				upstream_created_map[model_id] = created_at
+            return 'A' <= ch <= 'Z' or 'a' <= ch <= 'z'
 
-				entry = {
-					"id": model_id,
-					"object": "model",
-					"name": model_name,
-					"created": created_at,
-					"owned_by": "z.ai"
-				}
-				models.append(entry)
-				existing_ids.add(entry["id"])
+        token = utils.request.token()
+        headers = {**BROWSER_HEADERS}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
-			for variant_name, config in MODEL_VARIANT_CONFIG.items():
-				upstream_id = config.get("upstream_id")
-				if upstream_id and upstream_id not in upstream_created_map:
-					continue
-				if variant_name in existing_ids:
-					continue
+        response = requests.get(f"{BASE}/api/models", headers=headers, timeout=8)
+        if token_pool.contains(token):
+            if response.status_code in (401, 403):
+                token_pool.mark_failure(token)
+            else:
+                token_pool.mark_success(token)
 
-				metadata = {
-					"upstream_id": upstream_id,
-					"features": config.get("features", {}),
-					"mcp_servers": config.get("mcp_servers", [])
-				}
-				entry = {
-					"id": variant_name,
-					"object": "model",
-					"name": variant_name,
-					"created": upstream_created_map.get(upstream_id, int(datetime.now().timestamp())),
-					"owned_by": "z.ai",
-					"description": config.get("description", ""),
-					"metadata": metadata
-				}
-				models.append(entry)
-				existing_ids.add(variant_name)
-		return utils.request.response(jsonify({"object":"list","data":models}))
-	except Exception as e:
-		debug("模型列表失败: %s", e)
-		return utils.request.response(jsonify({"error":"fetch models failed"})), 500
+        r = response.json()
+        models = []
+        existing_ids = set()
+        upstream_created_map: Dict[str, int] = {}
+
+        for m in r.get("data", []):
+            if not m.get("info", {}).get("is_active", True):
+                continue
+
+            model_id, model_name = m.get("id"), m.get("name")
+            alias_name = MODEL_ID_ALIASES.get(model_id) if model_id else None
+            if alias_name:
+                model_name = alias_name
+            elif model_id and model_id.startswith(("GLM", "Z")):
+                model_name = model_id
+
+            if not model_name or not is_english_letter(model_name[0]):
+                model_name = format_model_name(model_id)
+
+            created_at = m.get("info", {}).get("created_at", int(datetime.now().timestamp()))
+            upstream_created_map[model_id] = created_at
+
+            entry = {
+                "id": model_id,
+                "object": "model",
+                "name": model_name,
+                "created": created_at,
+                "owned_by": "z.ai",
+            }
+            models.append(entry)
+            existing_ids.add(entry["id"])
+
+        for variant_name, config in MODEL_VARIANT_CONFIG.items():
+            upstream_id = config.get("upstream_id")
+            if upstream_id and upstream_id not in upstream_created_map:
+                continue
+            if variant_name in existing_ids:
+                continue
+
+            metadata = {
+                "upstream_id": upstream_id,
+                "features": config.get("features", {}),
+                "mcp_servers": config.get("mcp_servers", []),
+            }
+            entry = {
+                "id": variant_name,
+                "object": "model",
+                "name": variant_name,
+                "created": upstream_created_map.get(upstream_id, int(datetime.now().timestamp())),
+                "owned_by": "z.ai",
+                "description": config.get("description", ""),
+                "metadata": metadata,
+            }
+            models.append(entry)
+            existing_ids.add(variant_name)
+
+        return utils.request.response(jsonify({"object": "list", "data": models}))
+    except Exception as e:
+        debug("模型列表失败: %s", e)
+        return utils.request.response(jsonify({"error": "fetch models failed"})), 500
 
 @app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
 def OpenAI_Compatible():
