@@ -1058,8 +1058,7 @@ DASHBOARD_TEMPLATE = """
             }
             event.preventDefault();
             const tokens = newTokenInput.value
-                .split(/[
-,]+/)
+                .split(/[\n\r\t ,]+/)
                 .map(item => item.trim())
                 .filter(Boolean);
             if (!tokens.length) return;
