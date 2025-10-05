@@ -3,7 +3,9 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
-.env
+.dockerignore
 .git
 .gitignore
+.env
 .DS_Store
+data/

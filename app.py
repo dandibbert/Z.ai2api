@@ -22,6 +22,7 @@ from flask import (
         session,
         url_for,
         g,
+        has_request_context,
 )
 
 from dotenv import load_dotenv
@@ -41,6 +42,42 @@ SECRET_KEY = str(os.getenv("SECRET_KEY", "")).strip() or "zai2api-dashboard"
 RAW_TOKEN_POOL = str(os.getenv("TOKEN_POOL", "")).strip()
 TOKEN_POOL_FAILURE_THRESHOLD = int(os.getenv("TOKEN_POOL_FAILURE_THRESHOLD", "3"))
 TOKEN_POOL_RESET_FAILURES = int(os.getenv("TOKEN_POOL_RESET_FAILURES", "1800"))
+
+STATE_DIR = os.getenv(
+        "ZAI2API_STATE_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+)
+TOKEN_POOL_STATE_FILE = os.path.join(STATE_DIR, "token_pool.json")
+
+
+def _ensure_state_dir():
+        try:
+                os.makedirs(STATE_DIR, exist_ok=True)
+        except Exception:
+                logging.getLogger(__name__).warning("无法创建状态目录: %s", STATE_DIR)
+
+
+def _load_persisted_tokens() -> List[str]:
+        try:
+                with open(TOKEN_POOL_STATE_FILE, "r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+                        tokens = payload.get("tokens", [])
+                        if isinstance(tokens, list):
+                                return [str(token).strip() for token in tokens if str(token).strip()]
+        except FileNotFoundError:
+                return []
+        except Exception as exc:
+                logging.getLogger(__name__).warning("读取持久化 token 池失败: %s", exc)
+        return []
+
+
+def _persist_token_pool(tokens: List[str]):
+        try:
+                _ensure_state_dir()
+                with open(TOKEN_POOL_STATE_FILE, "w", encoding="utf-8") as fh:
+                        json.dump({"tokens": tokens}, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+                logging.getLogger(__name__).warning("写入持久化 token 池失败: %s", exc)
 
 # tiktoken 预加载
 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
@@ -96,6 +133,24 @@ def _parse_token_pool(raw: str) -> List[str]:
                 token = candidate.strip()
                 if token:
                         tokens.append(token)
+        return tokens
+
+
+def _normalize_token_inputs(values: Any) -> List[str]:
+        if values is None:
+                return []
+        if isinstance(values, str):
+                sources = [values]
+        elif isinstance(values, list):
+                sources = [str(item) for item in values]
+        else:
+                return []
+        tokens: List[str] = []
+        for source in sources:
+                for candidate in re.split(r"[\n,]", source):
+                        token = candidate.strip()
+                        if token:
+                                tokens.append(token)
         return tokens
 
 
@@ -208,10 +263,20 @@ class TokenPool:
 
 
 TOKEN_POOL_TOKENS = _parse_token_pool(RAW_TOKEN_POOL)
+persisted_tokens = _load_persisted_tokens()
+for token in persisted_tokens:
+        if token not in TOKEN_POOL_TOKENS:
+                TOKEN_POOL_TOKENS.append(token)
 if TOKEN and TOKEN not in TOKEN_POOL_TOKENS:
         TOKEN_POOL_TOKENS.append(TOKEN)
 
 token_pool = TokenPool(TOKEN_POOL_TOKENS, TOKEN_POOL_FAILURE_THRESHOLD)
+_persist_token_pool(token_pool.tokens())
+
+
+def _update_token_pool(tokens: List[str]):
+        token_pool.update(tokens)
+        _persist_token_pool(token_pool.tokens())
 
 
 class RequestMetrics:
@@ -300,12 +365,21 @@ class RequestMetrics:
 request_metrics = RequestMetrics()
 
 
-def _record_upstream_metrics(*, method: str, url: str, status_code: Optional[int], duration: float, error: Optional[str] = None):
+def _record_upstream_metrics(
+        *,
+        method: str,
+        url: str,
+        status_code: Optional[int],
+        duration: float,
+        error: Optional[str] = None,
+        token_info: Optional[Dict[str, Any]] = None,
+):
         try:
                 client_ip = _client_ip()
         except Exception:
                 client_ip = ""
-        token_info = getattr(g, "current_token_info", None)
+        if token_info is None and has_request_context():
+                token_info = getattr(g, "current_token_info", None)
         path = _format_upstream_path(url)
         return request_metrics.record(
                 method=method,
@@ -328,12 +402,14 @@ def _finalize_upstream_response(response, *, error: Optional[str] = None):
         method = context.get("method", "POST")
         duration = time.perf_counter() - start_time if start_time else 0.0
         status_code = response.status_code if error is None else None
+        token_info = context.get("token_info")
         _record_upstream_metrics(
                 method=method,
                 url=url,
                 status_code=status_code,
                 duration=duration,
                 error=error,
+                token_info=token_info,
         )
         token = context.get("token")
         if token_pool.contains(token):
@@ -368,6 +444,60 @@ def _require_api_auth():
                 return None
         response = jsonify({"error": "unauthorized"})
         return utils.request.response(make_response(response, 401))
+
+
+STATUS_PAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang=\"zh-CN\">
+<head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+    <title>Z.ai 2 API 状态</title>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            margin: 0;
+            font-family: 'Inter', 'PingFang SC', system-ui, -apple-system, sans-serif;
+            background: radial-gradient(circle at top, rgba(56, 189, 248, 0.15), transparent 50%), #020617;
+            color: #e2e8f0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .card {
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 16px;
+            padding: 32px;
+            max-width: 520px;
+            width: 90%;
+            box-shadow: 0 24px 48px rgba(15, 23, 42, 0.35);
+        }
+        h1 { margin: 0 0 16px 0; font-size: 28px; }
+        .status { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(34, 197, 94, 0.2); color: #4ade80; font-weight: 600; }
+        .meta { margin: 12px 0; font-size: 14px; color: #94a3b8; }
+        .meta span { display: block; margin-bottom: 6px; }
+        a { color: #38bdf8; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class=\"card\">
+        <h1>Z.ai 2 API</h1>
+        <div class=\"status\">服务运行中</div>
+        <div class=\"meta\">
+            <span>当前时间：{{ timestamp }}</span>
+            <span>匿名模式：{{ '启用' if anonymous_mode else '关闭' }}</span>
+            <span>Token 池容量：{{ token_count }}</span>
+        </div>
+        <p>代理已经启动，可以通过 OpenAI 兼容接口访问。{% if requires_auth %}已启用访问令牌校验，请在请求头或查询参数中携带 AUTH_TOKEN。{% endif %}</p>
+        <p>管理与监控：<a href=\"/dashboard\">打开 Dashboard</a></p>
+        <p>Token 池状态：<a href=\"/token-pool/status\">查看 JSON</a></p>
+    </div>
+</body>
+</html>
+"""
 
 
 DASHBOARD_TEMPLATE = """
@@ -605,7 +735,7 @@ DASHBOARD_TEMPLATE = """
                     <button type=\"submit\">添加 Token</button>
                 </form>
             </div>
-            <p class=\"help-text\">成功/失败次数基于通过代理发出的请求统计。移除操作即时生效。</p>
+            <p class=\"help-text\">成功/失败次数基于通过代理发出的请求统计。支持一次粘贴多个 Token（使用逗号或换行分隔），所有改动都会自动持久化。</p>
             <div class=\"table-wrapper\">
                 <table id=\"tokens-table\">
                     <thead>
@@ -775,13 +905,13 @@ DASHBOARD_TEMPLATE = """
 
         addTokenForm.addEventListener('submit', async (event) => {
             event.preventDefault();
-            const token = newTokenInput.value.trim();
-            if (!token) return;
+            const tokens = newTokenInput.value.split(/[\n,]/).map(item => item.trim()).filter(Boolean);
+            if (!tokens.length) return;
             const res = await fetch('/dashboard/api/tokens', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
-                body: JSON.stringify({ token }),
+                body: JSON.stringify({ tokens }),
             });
             if (res.ok) {
                 newTokenInput.value = '';
@@ -1105,6 +1235,7 @@ class utils:
                                 "url": url,
                                 "method": "POST",
                                 "token": token,
+                                "token_info": dict(getattr(g, "current_token_info", {}) or {}),
                                 "finalized": False,
                         }
                         return response
@@ -1312,6 +1443,19 @@ class utils:
                         return len(enc.encode(text))
 
 # 路由
+@app.route("/", methods=["GET"])
+def service_status_page():
+        snapshot = token_pool.snapshot()
+        token_count = snapshot.get("size", 0)
+        return render_template_string(
+                STATUS_PAGE_TEMPLATE,
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                anonymous_mode=ANONYMOUS_MODE,
+                token_count=token_count,
+                requires_auth=bool(AUTH_TOKEN),
+        )
+
+
 @app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
 def models():
     if request.method == "OPTIONS":
@@ -1812,15 +1956,21 @@ def dashboard_tokens():
                 }))
 
         data = request.get_json(force=True, silent=True) or {}
-        token_value = (data.get("token") or "").strip()
-        if not token_value:
+        tokens_payload = data.get("tokens")
+        token_value = data.get("token")
+        token_inputs = _normalize_token_inputs(tokens_payload if tokens_payload is not None else token_value)
+        if not token_inputs:
                 return utils.request.response(make_response(jsonify({"error": "token required"}), 400))
 
         current_tokens = token_pool.tokens()
         if request.method == "POST":
-                if token_value not in current_tokens:
-                        current_tokens.append(token_value)
-                        token_pool.update(current_tokens)
+                updated = False
+                for candidate in token_inputs:
+                        if candidate not in current_tokens:
+                                current_tokens.append(candidate)
+                                updated = True
+                if updated:
+                        _update_token_pool(current_tokens)
                 snapshot = token_pool.snapshot()
                 metrics_snapshot = request_metrics.snapshot()
                 return utils.request.response(jsonify({
@@ -1829,9 +1979,13 @@ def dashboard_tokens():
                         "token_stats": metrics_snapshot.get("token_stats", []),
                 }))
 
-        if token_value in current_tokens:
-                current_tokens.remove(token_value)
-                token_pool.update(current_tokens)
+        removed = False
+        for candidate in token_inputs:
+                if candidate in current_tokens:
+                        current_tokens.remove(candidate)
+                        removed = True
+        if removed:
+                _update_token_pool(current_tokens)
         snapshot = token_pool.snapshot()
         metrics_snapshot = request_metrics.snapshot()
         return utils.request.response(jsonify({
