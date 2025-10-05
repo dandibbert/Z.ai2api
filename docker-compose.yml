@@ -7,7 +7,7 @@ services:
     env_file:
       - .env
     ports:
-      - "${PORT:-8080}:8080"
+      - "${PORT:-8080}:${PORT:-8080}"
     volumes:
       - zai2api-data:/app/data
     restart: unless-stopped
