@@ -1465,23 +1465,28 @@ class utils:
                         return fallback_token or ""
                 @staticmethod
                 def response(resp):
-                        origin = request.headers.get("Origin")
-                        if origin:
-                                resp.headers["Access-Control-Allow-Origin"] = origin
-                                resp.headers["Vary"] = (
-                                        f"{resp.headers.get('Vary')}, Origin"
-                                        if resp.headers.get("Vary")
-                                        else "Origin"
-                                )
-                                resp.headers["Access-Control-Allow-Credentials"] = "true"
-                        else:
-                                resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+                        try:
+                                origin = request.headers.get("Origin", "").strip()
+                        except Exception:
+                                origin = ""
 
-                        allowed_methods = "GET, POST, DELETE, OPTIONS"
-                        resp.headers["Access-Control-Allow-Methods"] = allowed_methods
-                        resp.headers["Access-Control-Allow-Headers"] = (
-                                "Content-Type, Authorization, X-Auth-Token"
+                        allow_origin = origin or request.host_url.rstrip("/")
+
+                        existing_vary = resp.headers.get("Vary")
+                        vary_values = set(
+                                value.strip()
+                                for value in (existing_vary or "").split(",")
+                                if value.strip()
                         )
+                        vary_values.add("Origin")
+
+                        resp.headers.update({
+                                "Access-Control-Allow-Origin": allow_origin,
+                                "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+                                "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Auth-Token",
+                                "Access-Control-Allow-Credentials": "true",
+                                "Vary": ", ".join(sorted(vary_values)),
+                        })
                         return resp
         @staticmethod
         class response:
@@ -2065,10 +2070,8 @@ def dashboard_logout():
         return utils.request.response(flask_response)
 
 
-@app.route("/dashboard/api/overview", methods=["GET", "OPTIONS"])
+@app.route("/dashboard/api/overview", methods=["GET"])
 def dashboard_overview():
-        if request.method == "OPTIONS":
-                return utils.request.response(make_response())
         auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
@@ -2089,10 +2092,8 @@ def dashboard_overview():
         return utils.request.response(jsonify(payload))
 
 
-@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE", "OPTIONS"])
+@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE"])
 def dashboard_tokens():
-        if request.method == "OPTIONS":
-                return utils.request.response(make_response())
         auth_error = _require_dashboard_auth()
         if auth_error:
                 return auth_error
