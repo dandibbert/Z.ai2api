@@ -94,15 +94,59 @@ import tiktoken
 enc = tiktoken.get_encoding("cl100k_base")
 
 BROWSER_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
         "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "X-FE-Version": "prod-fe-1.0.76",
-        "sec-ch-ua": '"Not;A=Brand";v="99", "Edge";v="139"',
+        "Accept-Language": "zh-CN",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "Origin": BASE,
+        "Pragma": "no-cache",
+        "X-FE-Version": "prod-fe-1.0.95",
+        "sec-ch-ua": '"Not;A=Brand";v="99", "Edge";v="140"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
-        "Origin": BASE,
 }
+
+
+def generate_signature(e: str, t: str) -> Dict[str, Any]:
+        timestamp_ms = int(time.time() * 1000)
+        message_string = f"{e}|{t}|{timestamp_ms}"
+        n = timestamp_ms // (5 * 60 * 1000)
+        intermediate_key = hmac.new(
+                b"junjie",
+                str(n).encode("utf-8"),
+                hashlib.sha256,
+        ).hexdigest()
+        final_signature = hmac.new(
+                intermediate_key.encode("utf-8"),
+                message_string.encode("utf-8"),
+                hashlib.sha256,
+        ).hexdigest()
+        return {"signature": final_signature, "timestamp": timestamp_ms}
+
+
+def _extract_signature_prompt(messages: Any) -> str:
+        if not isinstance(messages, list) or not messages:
+                return ""
+        last_message = messages[-1]
+        if not isinstance(last_message, dict):
+                return str(last_message)
+        content = last_message.get("content")
+        if isinstance(content, str):
+                return content
+        if isinstance(content, list):
+                parts: List[str] = []
+                for item in content:
+                        if not isinstance(item, dict):
+                                continue
+                        if item.get("type") == "text":
+                                parts.append(item.get("text", ""))
+                        elif item.get("type") == "input_text":
+                                parts.append(item.get("input_text", ""))
+                if parts:
+                        return "".join(parts)
+        return "" if content is None else str(content)
 
 
 def _client_ip() -> str:
@@ -1398,6 +1442,20 @@ class utils:
                         headers = {**BROWSER_HEADERS, "Referer": f"{BASE}/c/{chat_id}"}
                         if token:
                                 headers["Authorization"] = f"Bearer {token}"
+                        params = {
+                                "requestId": str(uuid.uuid4()),
+                                "timestamp": str(int(time.time() * 1000)),
+                                "user_id": str(uuid.uuid4()),
+                        }
+                        e = "requestId,{request_id},timestamp,{timestamp},user_id,{user_id}".format(
+                                request_id=params["requestId"],
+                                timestamp=int(params["timestamp"]),
+                                user_id=params["user_id"],
+                        )
+                        t = _extract_signature_prompt(data.get("messages"))
+                        signature_payload = generate_signature(e, t)
+                        params["signature_timestamp"] = str(signature_payload["timestamp"])
+                        headers["X-Signature"] = signature_payload["signature"]
                         url = f"{BASE}/api/chat/completions"
                         start_time = time.perf_counter()
                         try:
@@ -1405,6 +1463,7 @@ class utils:
                                         url,
                                         json=data,
                                         headers=headers,
+                                        params=params,
                                         stream=True,
                                         timeout=60
                                 )
