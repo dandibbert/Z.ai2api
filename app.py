@@ -5,7 +5,7 @@ Z.ai 2 API
 基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 使用 AI 辅助重构。
 """
 
-import os, json, re, requests, logging, uuid, base64, time, hashlib, hmac
+import os, json, re, requests, logging, uuid, base64, time, hashlib, hmac, mimetypes
 from collections import defaultdict, deque
 from datetime import datetime
 from threading import Lock
@@ -1499,7 +1499,13 @@ class utils:
                                 mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
 
                                 image_data = base64.b64decode(encoded) # 解码数据
-                                filename = str(uuid.uuid4())
+
+                                extension = mimetypes.guess_extension(mime_type) or ""
+                                if extension == ".jpe":
+                                        extension = ".jpg"
+                                if not extension and mime_type.startswith("image/"):
+                                        extension = f".{mime_type.split('/', 1)[1]}"
+                                filename = f"{uuid.uuid4()}{extension}"
 
                                 debug("上传文件：%s", filename)
                                 token = utils.request.token(prefer_pool=True)
