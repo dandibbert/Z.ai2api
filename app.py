@@ -1709,7 +1709,22 @@ class utils:
                 @staticmethod
                 def models() -> Dict:
                         """获取模型列表"""
-                        current_token = utils.request.user().get('token') if cfg.api.anon else cfg.source.token
+                        current_token: Optional[str]
+                        if cfg.api.anon:
+                                if has_request_context():
+                                        current_token = utils.request.user().get('token')
+                                else:
+                                        log.debug("跳过请求上下文外的用户令牌解析，回退到静态令牌")
+                                        current_token = cfg.source.token
+                        else:
+                                current_token = cfg.source.token
+
+                        if not current_token:
+                                cached = utils.request._models_cache
+                                if cached:
+                                        return cached
+                                log.debug("无法获取模型列表：缺少有效令牌")
+                                return {"object": "list", "data": []}
 
                         if utils.request._models_cache:
                                 return utils.request._models_cache
