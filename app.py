@@ -1608,210 +1608,225 @@ class utils:
                         g.current_user_info = info
                         return info
 
-        @staticmethod
-        def signature(prarms: Dict, content: str) -> Dict:
-            for param in ["timestamp", "requestId", "user_id"]:
-                if param not in prarms or not prarms.get(param):
-                    raise ValueError(f"need prarm: {param}")
+                @staticmethod
+                def signature(prarms: Dict, content: str) -> Dict:
+                        for param in ["timestamp", "requestId", "user_id"]:
+                                if param not in prarms or not prarms.get(param):
+                                        raise ValueError(f"need prarm: {param}")
 
-            def _hmac_sha256(key: bytes, msg: bytes):
-                return hmac.new(key, msg, hashlib.sha256).hexdigest()
+                        def _hmac_sha256(key: bytes, msg: bytes):
+                                return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
-            # content = content.strip()
-            request_time = int(prarms.get("timestamp", datetime.now().timestamp() * 1000))  # 请求时间戳（毫秒）
+                        # content = content.strip()
+                        request_time = int(prarms.get("timestamp", datetime.now().timestamp() * 1000))  # 请求时间戳（毫秒）
 
-            # 第 1 级签名
-            signature_expire = request_time // (5 * 60 * 1000)  # 5 分钟粒度
-            signature_1_plaintext = str(signature_expire)
-            signature_1 = _hmac_sha256(b"junjie", signature_1_plaintext.encode('utf-8'))
+                        # 第 1 级签名
+                        signature_expire = request_time // (5 * 60 * 1000)  # 5 分钟粒度
+                        signature_1_plaintext = str(signature_expire)
+                        signature_1 = _hmac_sha256(b"junjie", signature_1_plaintext.encode('utf-8'))
 
-            # 第 2 级签名
-            content = base64.b64encode(content.encode('utf-8')).decode('ascii')
+                        # 第 2 级签名
+                        content = base64.b64encode(content.encode('utf-8')).decode('ascii')
 
-            signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
-            signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
-            signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
+                        signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
+                        signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
+                        signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
 
-            # .......:.---*==**==+===-=-::.....   .::::.:.................:::.:-::-:-::.  
-            # .....:.::==:+--==--=---:-=:::..  .-=+++*+++++=-:.   ......:.::::.:-:----:.      
-            # ...:.....::--::-----::::.::::. .-+*************++-:. .::..:.:::-::----=-::.     
-            # ........:..:.:-=-----::::::...:+++************+++++-. ..:::.:::---:=====-..        
-            # .......:.::::=-=-----:::::::..=*++++**********+++++=:  .-::::::--=--++++=..      .
-            # ......::..:::=-=-----::-*-=:.:=*+++++==+++=+====+===:..::.::--::--==++++=:.    ..  
-            # ........:-:::::---::::-:=::: -+=+++==++=++======++==-...===:.:-----=+*+==:..       
-            # . ..:++++*--=-=##+*=::-::::--=************++*+++*+==-.:.-:-:.:::---=+%%%%=..      .
-            #   ...:-=:.::::-%#=-:...::.:=++****#*******++**#***++-:-:-+-:==:..:--*%@@@*.... .:--
-            # ..::::::::--:::=---::::::..+*+*******+===::-+*****+=::---=--::.:::----=++=-::::.-==
-            # ::::::::::::---:-:::-:--:---*++***+*****+==+++++++==::=-------=--------------------
-            # :::::::::---------------: .:+++***++=++*+*+=-=++++=--==============================
-            # :::::--------------------::--=+****: .:...:. -+*++-================================
-            # ::::--------------------------==***+-+*+++-:-+*+=-=++=++++==++===============++====
-            # ----------------------------===-=*#**++**+++***--..-=++++++++++++++++++++++++++++++
-            # --------------------============--+**********+-:-.   :+++++++++++++++++++++++++++=+
-            # ------------------=============-. .-=++++++=-::--:    .=+*++++++++++++++++++======+
-            # --------====------===========-:...::..:-:::::::---   ...:=+++++++++++++++++++++++==
-            # -------=================---:......-=::=+==+=-::--:........-=+**++++++++++++++++++++
-            # --------==--========--::......... :++++*++**=:::::=-........:-=++++++++++++++++++++
-            # -----=---====----::.............:--+********+=-:==:.............:::-=++++++++--++==
-            # ======.:.:=---=-........ .....:=+**+**###*****++=:...................-+*++**+*+++++
-            # ======:.-----==:....... ......-*******##********++=....................-++++++:-+++
-            # +++++*+++*+++-................=*******************+:....................=*+*+++++++
-            # +++++++++++*-................-+********************-................... -*+++++++++
-            # +++++++++++*-...............:=+********************-..............::::..=++++++++++
-            # ++++++++++++=...............:=+********************-...............:---:-++++++++++
-            # +++++++++++*= ............   .-*******************=..:...................++++++++++
-            # +++++++**++=:........  .....  -*++**************+=: .....................-+++++++++
-            # +++++++=-:....................=*+=+++++=++******=:   ....--...............-++++++++
-            # ++++++-......................:***+==---::-==+===-........::.. .............=+++++++
-            # ++++++........................***+=-::.. .:-----:.:-..... .................:+======
-            # +++++=........................-==-:..     ...::...:-........................-++++++
-            # ++++++..........................          .      ............................:+++++
-            # ++++++.........................        .....        .........................:+++++
-            # ++++++: ........................  ...........    ............................-*++++
-            # +++++*- ........................  ............   ............ ...............=+++++
-            # 哎呀！哎呀！哎呀呀呀！
-            # 哎↘呀哎↘↗呀哎呀呀呀
-            # junjie，jun 总啊！
-            # 您怎么就改了签名算法啊哎呀！
-            # 哎呀哎呀哎呀呀呀呀呀
-            # 太感谢我 jun 总了呀呀呀呀
-            # 太性情 太感谢 太通透了
-            # 直接就宣判了啊！
-            # 这可是带 hmac 的签名算法
-            # 砸到小户身上脸都是疼的~
-            # 祝开发此签名的开发者
-            # 学业工作都顺利
-            # 用苹果手机
-            # 开苹果汽车
-            # 住苹果房子
-            # 享苹果人生
-            # 你必定是
-            # 开兰博基尼
-            # 坐私人飞机
-            # 同时也祝您和您的家里人
-            # 身体健康
-            # 事业顺利
-            # 家庭幸福
-            # 在以后的人生里
-            # 购买力越来越苹果爆赞👍
+                        # .......:.---*==**==+===-=-::.....   .::::.:.................:::.:-::-:-::.
+                        # .....:.::==:+--==--=---:-=:::..  .-=+++*+++++=-:.   ......:.::::.:-:----:.
+                        # ...:.....::--::-----::::.::::. .-+*************++-:. .::..:.:::-::----=-::.
+                        # ........:..:.:-=-----::::::...:+++************+++++-. ..:::.:::---:=====-..
+                        # .......:.::::=-=-----:::::::..=*++++**********+++++=:  .-::::::--=--++++=..      .
+                        # ......::..:::=-=-----::-*-=:.:=*+++++==+++=+====+===:..::.::--::--==++++=:.    ..
+                        # ........:-:::::---::::-:=::: -+=+++==++=++======++==-...===:.:-----=+*+==:..
+                        # . ..:++++*--=-=##+*=::-::::--=************++*+++*+==-.:.-:-:.:::---=+%%%%=..      .
+                        #   ...:-=:.::::-%#=-:...::.:=++****#*******++**#***++-:-:-+-:==:..:--*%@@@*.... .:--
+                        # ..::::::::--:::=---::::::..+*+*******+===::-+*****+=::---=--::.:::----=++=-::::.-==
+                        # ::::::::::::---:-:::-:--:---*++***+*****+==+++++++==::=-------=--------------------
+                        # :::::::::---------------: .:+++***++=++*+*+=-=++++=--==============================
+                        # :::::--------------------::--=+****: .:...:. -+*++-================================
+                        # ::::--------------------------==***+-+*+++-:-+*+=-=++=++++==++===============++====
+                        # ----------------------------===-=*#**++**+++***--..-=++++++++++++++++++++++++++++++
+                        # --------------------============--+**********+-:-.   :+++++++++++++++++++++++++++=+
+                        # ------------------=============-. .-=++++++=-::--:    .=+*++++++++++++++++++======+
+                        # --------====------===========-:...::..:-:::::::---   ...:=+++++++++++++++++++++++==
+                        # -------=================---:......-=::=+==+=-::--:........-=+**++++++++++++++++++++
+                        # --------==--========--::......... :++++*++**=:::::=-........:-=++++++++++++++++++++
+                        # -----=---====----::.............:--+********+=-:==:.............:::-=++++++++--++==
+                        # ======.:.:=---=-........ .....:=+**+**###*****++=:...................-+*++**+*+++++
+                        # ======:.-----==:....... ......-*******##********++=....................-++++++:-+++
+                        # +++++*+++*+++-................=*******************+:....................=*+*+++++++
+                        # +++++++++++*-................-+********************-................... -*+++++++++
+                        # +++++++++++*-...............:=+********************-..............::::..=++++++++++
+                        # ++++++++++++=...............:=+********************-...............:---:-++++++++++
+                        # +++++++++++*= ............   .-*******************=..:...................++++++++++
+                        # +++++++**++=:........  .....  -*++**************+=: .....................-+++++++++
+                        # +++++++=-:....................=*+=+++++=++******=:   ....--...............-++++++++
+                        # ++++++-......................:***+==---::-==+===-........::.. .............=+++++++
+                        # ++++++........................***+=-::.. .:-----:.:-..... .................:+======
+                        # +++++=........................-==-:..     ...::...:-........................-++++++
+                        # ++++++..........................          .      ............................:+++++
+                        # ++++++.........................        .....        .........................:+++++
+                        # ++++++: ........................  ...........    ............................-*++++
+                        # +++++*- ........................  ............   ............ ...............=+++++
+                        # 哎呀！哎呀！哎呀呀呀！
+                        # 哎↘呀哎↘↗呀哎呀呀呀
+                        # junjie，jun 总啊！
+                        # 您怎么就改了签名算法啊哎呀！
+                        # 哎呀哎呀哎呀呀呀呀呀
+                        # 太感谢我 jun 总了呀呀呀呀
+                        # 太性情 太感谢 太通透了
+                        # 直接就宣判了啊！
+                        # 这可是带 hmac 的签名算法
+                        # 砸到小户身上脸都是疼的~
+                        # 祝开发此签名的开发者
+                        # 学业工作都顺利
+                        # 用苹果手机
+                        # 开苹果汽车
+                        # 住苹果房子
+                        # 享苹果人生
+                        # 你必定是
+                        # 开兰博基尼
+                        # 坐私人飞机
+                        # 同时也祝您和您的家里人
+                        # 身体健康
+                        # 事业顺利
+                        # 家庭幸福
+                        # 在以后的人生里
+                        # 购买力越来越苹果爆赞👍
 
-            log.debug("生成签名: %s", signature_2)
-            log.debug("  请求时间: %s", prarms.get("timestamp"))
-            log.debug("  请求标识: %s", prarms.get("requestId"))
-            log.debug("  用户标识: %s", prarms.get("user_id"))
-            log.debug("  最后内容: %s", content[:50])
-            return {
-                "signature": signature_2,
-                "timestamp": request_time
-            }
+                        log.debug("生成签名: %s", signature_2)
+                        log.debug("  请求时间: %s", prarms.get("timestamp"))
+                        log.debug("  请求标识: %s", prarms.get("requestId"))
+                        log.debug("  用户标识: %s", prarms.get("user_id"))
+                        log.debug("  最后内容: %s", content[:50])
+                        return {
+                                "signature": signature_2,
+                                "timestamp": request_time
+                        }
 
-        _models_cache = {}
-        @staticmethod
-        def models() -> Dict:
-            """获取模型列表"""
-            current_token = utils.request.user().get('token') if cfg.api.anon else cfg.source.token
+                _models_cache = {}
+                @staticmethod
+                def models() -> Dict:
+                        """获取模型列表"""
+                        current_token: Optional[str]
+                        if cfg.api.anon:
+                                if has_request_context():
+                                        current_token = utils.request.user().get('token')
+                                else:
+                                        log.debug("跳过请求上下文外的用户令牌解析，回退到静态令牌")
+                                        current_token = cfg.source.token
+                        else:
+                                current_token = cfg.source.token
 
-            if utils.request._models_cache:
-                return utils.request._models_cache
+                        if not current_token:
+                                cached = utils.request._models_cache
+                                if cached:
+                                        return cached
+                                log.debug("无法获取模型列表：缺少有效令牌")
+                                return {"object": "list", "data": []}
 
-            def format_model_name(name: str) -> str:
-                """格式化模型名"""
-                if not name:
-                    return ""
-                parts = name.split('-')
-                if len(parts) == 1:
-                    return parts[0].upper()
-                formatted = [parts[0].upper()]
-                for p in parts[1:]:
-                    if not p:
-                        formatted.append("")
-                    elif p.isdigit():
-                        formatted.append(p)
-                    elif any(c.isalpha() for c in p):
-                        formatted.append(p.capitalize())
-                    else:
-                        formatted.append(p)
-                return "-".join(formatted)
+                        if utils.request._models_cache:
+                                return utils.request._models_cache
 
-            def get_model_name(source_id: str, model_name: str) -> str:
-                """获取模型名称：优先自带，其次智能生成"""
+                        def format_model_name(name: str) -> str:
+                                """格式化模型名"""
+                                if not name:
+                                        return ""
+                                parts = name.split('-')
+                                if len(parts) == 1:
+                                        return parts[0].upper()
+                                formatted = [parts[0].upper()]
+                                for p in parts[1:]:
+                                        if not p:
+                                                formatted.append("")
+                                        elif p.isdigit():
+                                                formatted.append(p)
+                                        elif any(c.isalpha() for c in p):
+                                                formatted.append(p.capitalize())
+                                        else:
+                                                formatted.append(p)
+                                return "-".join(formatted)
 
-                # 处理自带系列名的模型名称
-                if source_id.startswith(("GLM", "Z")) and "." in source_id:
-                    return source_id
+                        def get_model_name(source_id: str, model_name: str) -> str:
+                                """获取模型名称：优先自带，其次智能生成"""
 
-                if model_name.startswith(("GLM", "Z")) and "." in model_name:
-                    return model_name
+                                # 处理自带系列名的模型名称
+                                if source_id.startswith(("GLM", "Z")) and "." in source_id:
+                                        return source_id
 
-                # 无法识别系列名，但名称仍为英文
-                if not model_name or not ('A' <= model_name[0] <= 'Z' or 'a' <= model_name[0] <= 'z'):
-                    model_name = format_model_name(source_id)
-                    if not model_name.upper().startswith(("GLM", "Z")): model_name = model_name = "GLM-" + format_model_name(source_id)
+                                if model_name.startswith(("GLM", "Z")) and "." in model_name:
+                                        return model_name
 
-                return model_name
+                                # 无法识别系列名，但名称仍为英文
+                                if not model_name or not ('A' <= model_name[0] <= 'Z' or 'a' <= model_name[0] <= 'z'):
+                                        model_name = format_model_name(source_id)
+                                        if not model_name.upper().startswith(("GLM", "Z")): model_name = model_name = "GLM-" + format_model_name(source_id)
 
-            def get_model_id(source_id: str, model_name: str) -> str:
-                """获取模型 ID：优先配置，其次智能生成"""
-                if hasattr(cfg.model, 'mapping') and source_id in cfg.model.mapping:
-                    return cfg.model.mapping[source_id]
+                                return model_name
 
-                # 找不到配置则生成智能 ID
-                smart_id = model_name.lower()
-                cfg.model.mapping[source_id] = smart_id
-                return smart_id
+                        def get_model_id(source_id: str, model_name: str) -> str:
+                                """获取模型 ID：优先配置，其次智能生成"""
+                                if hasattr(cfg.model, 'mapping') and source_id in cfg.model.mapping:
+                                        return cfg.model.mapping[source_id]
 
-            headers = {
-                **cfg.headers(),
-                "Authorization": f"Bearer {current_token}",
-                "Content-Type": "application/json"
-            }
-            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                models = []
-                for m in data.get("data", []):
-                    if not m.get("info", {}).get("is_active", True):
-                        continue
-                    model_id = m.get("id")
-                    model_name = m.get("name")
-                    model_info = m.get("info", {})
-                    model_meta = model_info.get("meta", {})
-                    model_logo = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2030%2030%22%20style%3D%22background%3A%232D2D2D%22%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M15.47%207.1l-1.3%201.85c-.2.29-.54.47-.9.47h-7.1V7.09c0%20.01%209.31.01%209.31.01z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M24.3%207.1L13.14%2022.91H5.7l11.16-15.81z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M14.53%2022.91l1.31-1.86c.2-.29.54-.47.9-.47h7.09v2.33h-9.3z%22%2F%3E%3C%2Fsvg%3E"
+                                # 找不到配置则生成智能 ID
+                                smart_id = model_name.lower()
+                                cfg.model.mapping[source_id] = smart_id
+                                return smart_id
 
-                    model_meta_r = {
-                        "profile_image_url": model_logo,
-                        "capabilities": model_meta.get("capabilities"),
-                        "description": model_meta.get("description"),
-                        "hidden": model_meta.get("hidden"),
-                        "suggestion_prompts": [{"content": item["prompt"]} for item in (model_meta.get("suggestion_prompts") or []) if isinstance(item, dict) and "prompt" in item]
-                    }
-                    models.append({
-                        "id": get_model_id(model_id, get_model_name(model_id, model_name)),
-                        "object": "model",
-                        "name": get_model_name(model_id, model_name),
-                        "meta": model_meta_r,
-                        "info": {
-                            "meta": model_meta_r
-                        },
-                        "created": model_info.get("created_at", int(datetime.now().timestamp())),
-                        "owned_by": "z.ai",
-                        "orignal": {
-                            "name": model_name,
-                            "id": model_id,
-                            "info": model_info
-                        },
-                        # Special For Open WebUI
-                        # So, Fuck you! Private!
-                        "access_control": None,
-                    })
-                result = {
-                    "object": "list",
-                    "data": models,
-                }
-                utils.request._models_cache = result
-                return result
-            else:
-                raise Exception(f"fetch models info fail: {response.text}")
+                        headers = {
+                                **cfg.headers(),
+                                "Authorization": f"Bearer {current_token}",
+                                "Content-Type": "application/json"
+                        }
+                        response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers)
+                        if response.status_code == 200:
+                                data = response.json()
+                                models = []
+                                for m in data.get("data", []):
+                                        if not m.get("info", {}).get("is_active", True):
+                                                continue
+                                        model_id = m.get("id")
+                                        model_name = m.get("name")
+                                        model_info = m.get("info", {})
+                                        model_meta = model_info.get("meta", {})
+                                        model_logo = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2030%2030%22%20style%3D%22background%3A%232D2D2D%22%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M15.47%207.1l-1.3%201.85c-.2.29-.54.47-.9.47h-7.1V7.09c0%20.01%209.31.01%209.31.01z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M24.3%207.1L13.14%2022.91H5.7l11.16-15.81z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M14.53%2022.91l1.31-1.86c.2-.29.54-.47.9-.47h7.09v2.33h-9.3z%22%2F%3E%3C%2Fsvg%3E"
+
+                                        model_meta_r = {
+                                                "profile_image_url": model_logo,
+                                                "capabilities": model_meta.get("capabilities"),
+                                                "description": model_meta.get("description"),
+                                                "hidden": model_meta.get("hidden"),
+                                                "suggestion_prompts": [{"content": item["prompt"]} for item in (model_meta.get("suggestion_prompts") or []) if isinstance(item, dict) and "prompt" in item]
+                                        }
+                                        models.append({
+                                                "id": get_model_id(model_id, get_model_name(model_id, model_name)),
+                                                "object": "model",
+                                                "name": get_model_name(model_id, model_name),
+                                                "meta": model_meta_r,
+                                                "info": {
+                                                        "meta": model_meta_r
+                                                },
+                                                "created": model_info.get("created_at", int(datetime.now().timestamp())),
+                                                "owned_by": "z.ai",
+                                                "orignal": {
+                                                        "name": model_name,
+                                                        "id": model_id,
+                                                        "info": model_info
+                                                },
+                                                # Special For Open WebUI
+                                                # So, Fuck you! Private!
+                                                "access_control": None,
+                                        })
+                                result = {
+                                        "object": "list",
+                                        "data": models,
+                                }
+                                utils.request._models_cache = result
+                                return result
+                        else:
+                                raise Exception(f"fetch models info fail: {response.text}")
 
         @staticmethod
         def response(resp):
