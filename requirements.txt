@@ -1,4 +1,6 @@
-﻿requests
+requests
 flask
 load_dotenv
 tiktoken
+gevent
+pywsgi

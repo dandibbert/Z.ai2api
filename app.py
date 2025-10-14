@@ -1,41 +1,47 @@
-﻿# -*- coding: utf-8 -*-
+﻿#!/usr/bin/python
+# -*- coding: UTF-8 -*-
 """
 Z.ai 2 API
-将 Z.ai 代理为 OpenAI Compatible 格式，支持免令牌、智能处理思考链、图片上传（仅登录后）等功能
+将 Z.ai 代理为 OpenAI/Anthropic Compatible 格式，支持免令牌、智能处理思考链、图片上传（仅登录后）等功能
 基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 使用 AI 辅助重构。
 """
 
-import os, json, re, requests, logging, uuid, base64, time, hashlib, hmac, mimetypes
+import os, re, json, base64, urllib.parse, requests, hashlib, hmac, uuid, traceback, logging, time, mimetypes
 from collections import defaultdict, deque
 from datetime import datetime
 from threading import Lock
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
-from flask import (
-        Flask,
-        Response,
-        jsonify,
-        make_response,
-        redirect,
-        render_template_string,
-        request,
-        session,
-        url_for,
-        g,
-        has_request_context,
-)
+from flask import Flask, request, Response, jsonify, make_response, redirect, render_template_string, session, url_for, g, has_request_context
+from typing import Any, Dict, List, Union, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
 
 # 配置
-BASE = str(os.getenv("BASE", "https://chat.z.ai"))
-PORT = int(os.getenv("PORT", "8080"))
-MODEL = str(os.getenv("MODEL", "GLM-4.5"))
-TOKEN = str(os.getenv("TOKEN", "")).strip()
-DEBUG_MODE = str(os.getenv("DEBUG", "false")).lower() == "true"
-THINK_TAGS_MODE = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
-ANONYMOUS_MODE = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
+_raw_protocol = str(os.getenv("PROTOCOL", "")).strip()
+_raw_base = str(os.getenv("BASE", "chat.z.ai")).strip()
+_parsed_base = urllib.parse.urlparse(_raw_base) if _raw_base.startswith(("http://", "https://")) else None
+_base_protocol = f"{_parsed_base.scheme}:" if _parsed_base and _parsed_base.scheme else (_raw_protocol if _raw_protocol.endswith(":") else (f"{_raw_protocol}:" if _raw_protocol else "https:"))
+_base_host = (_parsed_base.netloc or _parsed_base.path) if _parsed_base else _raw_base
+_base_host = _base_host.rstrip("/") or "chat.z.ai"
+
+
+class cfg:
+        class source:
+                protocol = _base_protocol
+                host = _base_host
+                token = str(os.getenv("TOKEN", "")).strip()
+        class api:
+                port = int(os.getenv("PORT", "8080"))
+                debug = str(os.getenv("DEBUG", "false")).lower() == "true"
+                debug_msg = str(os.getenv("DEBUG_MSG", "false")).lower() == "true"
+                think = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
+                anon = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
+        class model:
+                default = str(os.getenv("MODEL", "glm-4.6"))
+                mapping = {}
+
+
+BASE_URL = f"{cfg.source.protocol}//{cfg.source.host}"
 AUTH_TOKEN = str(os.getenv("AUTH_TOKEN", "")).strip()
 SECRET_KEY = str(os.getenv("SECRET_KEY", "")).strip() or "zai2api-dashboard"
 
@@ -85,87 +91,6 @@ def _persist_token_pool(tokens: List[str]):
                         json.dump({"tokens": tokens, "salt": TOKEN_HASH_SECRET}, fh, ensure_ascii=False, indent=2)
         except Exception as exc:
                 logging.getLogger(__name__).warning("写入持久化 token 池失败: %s", exc)
-
-# tiktoken 预加载
-cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
-os.environ["TIKTOKEN_CACHE_DIR"] = cache_dir
-assert os.path.exists(os.path.join(cache_dir, "9b5ad71b2ce5302211f9c61530b329a4922fc6a4")) # cl100k_base.tiktoken
-import tiktoken
-enc = tiktoken.get_encoding("cl100k_base")
-
-BROWSER_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Content-Type": "application/json",
-        "Origin": BASE,
-        "Pragma": "no-cache",
-        "X-FE-Version": "prod-fe-1.0.95",
-        "sec-ch-ua": '"Not;A=Brand";v="99", "Edge";v="140"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-}
-
-
-def generate_signature(e: str, t: str) -> Dict[str, Any]:
-        timestamp_ms = int(time.time() * 1000)
-        message_string = f"{e}|{t}|{timestamp_ms}"
-        n = timestamp_ms // (5 * 60 * 1000)
-        intermediate_key = hmac.new(
-                b"junjie",
-                str(n).encode("utf-8"),
-                hashlib.sha256,
-        ).hexdigest()
-        final_signature = hmac.new(
-                intermediate_key.encode("utf-8"),
-                message_string.encode("utf-8"),
-                hashlib.sha256,
-        ).hexdigest()
-        return {"signature": final_signature, "timestamp": timestamp_ms}
-
-
-def _extract_signature_prompt(messages: Any) -> str:
-        if not isinstance(messages, list) or not messages:
-                return ""
-        last_message = messages[-1]
-        if not isinstance(last_message, dict):
-                return str(last_message)
-        content = last_message.get("content")
-        if isinstance(content, str):
-                return content
-        if isinstance(content, list):
-                parts: List[str] = []
-                for item in content:
-                        if not isinstance(item, dict):
-                                continue
-                        if item.get("type") == "text":
-                                parts.append(item.get("text", ""))
-                        elif item.get("type") == "input_text":
-                                parts.append(item.get("input_text", ""))
-                if parts:
-                        return "".join(parts)
-        return "" if content is None else str(content)
-
-
-def _client_ip() -> str:
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-                return forwarded.split(",")[0].strip()
-        return request.remote_addr or ""
-
-
-def _format_upstream_path(url: str) -> str:
-        if not url:
-                return ""
-        parsed = urlparse(url)
-        path = parsed.path or "/"
-        if parsed.query:
-                path = f"{path}?{parsed.query}"
-        if parsed.netloc:
-                return f"{parsed.netloc}{path}"
-        return url
 
 
 def _parse_token_pool(raw: str) -> List[str]:
@@ -233,12 +158,12 @@ class TokenPool:
                         return token
 
         def mark_success(self, token: Optional[str]):
-                if not token or token not in self._tokens:
-                        return
-                with self._lock:
-                        self._successes[token] = self._successes.get(token, 0) + 1
-                        self._failures.pop(token, None)
-                        self._disabled.pop(token, None)
+                        if not token or token not in self._tokens:
+                                return
+                        with self._lock:
+                                self._successes[token] = self._successes.get(token, 0) + 1
+                                self._failures.pop(token, None)
+                                self._disabled.pop(token, None)
 
         def mark_failure(self, token: Optional[str]):
                 if not token or token not in self._tokens:
@@ -346,8 +271,8 @@ TOKEN_POOL_TOKENS = _parse_token_pool(RAW_TOKEN_POOL)
 for token in _persisted_tokens:
         if token not in TOKEN_POOL_TOKENS:
                 TOKEN_POOL_TOKENS.append(token)
-if TOKEN and TOKEN not in TOKEN_POOL_TOKENS:
-        TOKEN_POOL_TOKENS.append(TOKEN)
+if cfg.source.token and cfg.source.token not in TOKEN_POOL_TOKENS:
+        TOKEN_POOL_TOKENS.append(cfg.source.token)
 
 token_pool = TokenPool(TOKEN_POOL_TOKENS, TOKEN_POOL_FAILURE_THRESHOLD)
 _persist_token_pool(token_pool.tokens())
@@ -356,6 +281,25 @@ _persist_token_pool(token_pool.tokens())
 def _update_token_pool(tokens: List[str]):
         token_pool.update(tokens)
         _persist_token_pool(token_pool.tokens())
+
+
+def _client_ip() -> str:
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+                return forwarded.split(",")[0].strip()
+        return request.remote_addr or ""
+
+
+def _format_upstream_path(url: str) -> str:
+        if not url:
+                return ""
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query:
+                path = f"{path}?{parsed.query}"
+        if parsed.netloc:
+                return f"{parsed.netloc}{path}"
+        return url
 
 
 class RequestMetrics:
@@ -380,7 +324,7 @@ class RequestMetrics:
                 if token_source == "anonymous" or not token_value:
                         token_display = "匿名 token"
                         token_id = None
-                elif token_source == "pool" or token_source == "static":
+                elif token_source in ("pool", "static"):
                         token_id = _token_identifier(token_value)
                         token_display = _token_display_from_id(token_id)
                 else:
@@ -399,16 +343,14 @@ class RequestMetrics:
                         self._token_stats[key]["source"] = token_source
                         if token_display:
                                 self._token_stats[key]["display"] = token_display
-
                         entry = {
-                                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                "timestamp": datetime.now().isoformat(),
                                 "method": method,
                                 "path": path,
-                                "status": status_code if status_code is not None else 0,
-                                "duration_ms": round(duration * 1000, 2),
+                                "status_code": status_code,
+                                "duration_ms": int(duration * 1000),
                                 "client_ip": client_ip,
-                                "token_display": token_display,
-                                "token_source": token_source,
+                                "token": token_display,
                         }
                         if error:
                                 entry["error"] = error
@@ -449,15 +391,7 @@ class RequestMetrics:
 request_metrics = RequestMetrics()
 
 
-def _record_upstream_metrics(
-        *,
-        method: str,
-        url: str,
-        status_code: Optional[int],
-        duration: float,
-        error: Optional[str] = None,
-        token_info: Optional[Dict[str, Any]] = None,
-):
+def _record_upstream_metrics(*, method: str, url: str, status_code: Optional[int], duration: float, error: Optional[str] = None, token_info: Optional[Dict[str, Any]] = None):
         try:
                 client_ip = _client_ip()
         except Exception:
@@ -566,7 +500,7 @@ def _build_dashboard_payload() -> Dict[str, Any]:
         metrics_snapshot = request_metrics.snapshot()
         token_snapshot = token_pool.snapshot()
         return {
-                "anonymous_mode": ANONYMOUS_MODE,
+                "anonymous_mode": cfg.api.anon,
                 "stats": {
                         "total_requests": metrics_snapshot.get("total_requests", 0),
                         "success_requests": metrics_snapshot.get("success_requests", 0),
@@ -618,15 +552,16 @@ STATUS_PAGE_TEMPLATE = """
 <body>
     <div class=\"card\">
         <h1>Z.ai 2 API</h1>
-        <div class=\"status\">服务运行中</div>
-        <div class=\"meta\">
-            <span>当前时间：{{ timestamp }}</span>
-            <span>匿名模式：{{ '启用' if anonymous_mode else '关闭' }}</span>
-            <span>Token 池容量：{{ token_count }}</span>
+        <div class=\"status\">
+            <span>●</span>
+            <span>在线</span>
         </div>
-        <p>代理已经启动，可以通过 OpenAI 兼容接口访问。{% if requires_auth %}已启用访问令牌校验，请在请求头或查询参数中携带 AUTH_TOKEN。{% endif %}</p>
-        <p>管理与监控：<a href=\"/dashboard\">打开 Dashboard</a></p>
-        <p>Token 池状态：<a href=\"/token-pool/status\">查看 JSON</a></p>
+        <div class=\"meta\">
+            <span>上游：{{ upstream }}</span>
+            <span>端口：{{ port }}</span>
+            <span>匿名模式：{{ '启用' if anonymous_mode else '关闭' }}</span>
+        </div>
+        <a href=\"/dashboard\">打开监控面板 →</a>
     </div>
 </body>
 </html>
@@ -639,41 +574,29 @@ DASHBOARD_TEMPLATE = """
 <head>
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>Z.ai 2 API 监控面板</title>
+    <title>Z.ai 2 API 仪表盘</title>
     <style>
-        :root {
-            color-scheme: dark;
-            --bg: #0b0f1a;
-            --card: rgba(17, 24, 39, 0.72);
-            --border: rgba(148, 163, 184, 0.25);
-            --accent: #22d3ee;
-            --accent-muted: rgba(34, 211, 238, 0.2);
-            --text: #f8fafc;
-            --muted: #94a3b8;
-            --danger: #f87171;
-            --success: #34d399;
-        }
+        :root { color-scheme: dark; }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             font-family: 'Inter', 'PingFang SC', system-ui, -apple-system, sans-serif;
-            background: radial-gradient(circle at top, rgba(56, 189, 248, 0.12), transparent 45%), var(--bg);
-            color: var(--text);
-            min-height: 100vh;
+            background: #020617;
+            color: #e2e8f0;
         }
         header {
-            padding: 24px 32px 0 32px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 16px;
+            padding: 32px 32px 16px 32px;
         }
         header h1 {
             margin: 0;
-            font-size: 26px;
+            font-size: 28px;
             font-weight: 600;
+            letter-spacing: -0.02em;
         }
-        header .tag {
+        .tag {
             display: inline-flex;
             align-items: center;
             gap: 8px;
@@ -890,7 +813,7 @@ DASHBOARD_TEMPLATE = """
             </div>
         </section>
     </main>
-    <script type="application/json" id="dashboard-initial-data">{{ initial_data|safe }}</script>
+    <script type=\"application/json\" id=\"dashboard-initial-data\">{{ initial_data|safe }}</script>
     <script>
     (() => {
         const autoRefreshToggle = document.getElementById('auto-refresh');
@@ -920,146 +843,57 @@ DASHBOARD_TEMPLATE = """
             }
         }
 
-        const escapeHtml = (value) => {
-            if (value === undefined || value === null) return '';
-            return String(value).replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
-        };
-
-        function renderRequests(list) {
-            if (!Array.isArray(list) || list.length === 0) {
-                requestsBody.innerHTML = `
-                    <tr>
-                        <td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">暂无请求</td>
-                    </tr>
-                `;
-                return;
-            }
-            requestsBody.innerHTML = list.map(item => `
-                <tr>
-                    <td>${escapeHtml(item.timestamp)}</td>
-                    <td>${escapeHtml(item.method)}</td>
-                    <td>${escapeHtml(item.path)}</td>
-                    <td><span class="badge ${item.status >= 400 ? 'danger' : 'success'}">${item.status}</span></td>
-                    <td>${item.duration_ms}</td>
-                    <td>${escapeHtml(item.client_ip)}</td>
-                    <td>${escapeHtml(item.token_display)}</td>
-                </tr>
-            `).join('');
+        function formatNumber(value) {
+            return (value ?? 0).toLocaleString('zh-CN');
         }
 
-        function buildTokenRows(tokenStats, tokenPool) {
-            const rows = [];
-            const statsMap = new Map();
-            const statsArray = Array.isArray(tokenStats) ? tokenStats : [];
-            statsArray.forEach(item => {
-                const key = item.token_id || `__${item.source}__`;
-                statsMap.set(key, item);
-            });
-
-            const seen = new Set();
-            const poolTokens = tokenPool && Array.isArray(tokenPool.tokens) ? tokenPool.tokens : [];
-            poolTokens.forEach(item => {
-                const stat = statsMap.get(item.token_id) || { display: item.display, source: 'pool', success: 0, failure: 0 };
-                rows.push({
-                    token_id: item.token_id,
-                    display: item.display,
-                    source: stat.source || 'pool',
-                    success: stat.success || 0,
-                    failure: stat.failure || 0,
-                    disabled: !!item.disabled,
-                    cooldown: item.cooldown_seconds || 0,
-                });
-                seen.add(item.token_id);
-            });
-
-            statsMap.forEach((stat, key) => {
-                if (key.startsWith('__')) {
-                    if (stat.source === 'anonymous') {
-                        rows.push({
-                            token_id: null,
-                            display: stat.display || '匿名 token',
-                            source: 'anonymous',
-                            success: stat.success || 0,
-                            failure: stat.failure || 0,
-                            disabled: false,
-                            cooldown: 0,
-                        });
-                    }
-                    return;
-                }
-                if (!seen.has(key)) {
-                    rows.push({
-                        token_id: key,
-                        display: stat.display || 'Token',
-                        source: stat.source || 'static',
-                        success: stat.success || 0,
-                        failure: stat.failure || 0,
-                        disabled: false,
-                        cooldown: 0,
-                    });
-                }
-            });
-
-            return rows;
-        }
-
-        function renderTokens(tokenStats, tokenPool) {
-            const rows = buildTokenRows(tokenStats, tokenPool);
-            if (!rows.length) {
-                tokensBody.innerHTML = `
-                    <tr>
-                        <td colspan="7" style="text-align:center;color:var(--muted);padding:20px;">暂无令牌</td>
-                    </tr>
-                `;
-                return;
+        function formatTimestamp(ts) {
+            try {
+                return new Date(ts).toLocaleString();
+            } catch (_) {
+                return ts;
             }
-            tokensBody.innerHTML = rows.map(item => {
-                const status = item.source === 'anonymous' ? '匿名' : (item.disabled ? '禁用' : '活跃');
-                const actionButton = item.token_id ? `<button type="button" class="ghost" data-token-id="${escapeHtml(item.token_id)}">移除</button>` : '';
-                return `
-                    <tr>
-                        <td>${escapeHtml(item.display)}</td>
-                        <td>${escapeHtml(item.source)}</td>
-                        <td>${item.success}</td>
-                        <td>${item.failure}</td>
-                        <td>${escapeHtml(status)}</td>
-                        <td>${item.cooldown}</td>
-                        <td>${actionButton}</td>
-                    </tr>
-                `;
-            }).join('');
         }
 
         function applyOverview(data) {
-            if (!data || typeof data !== 'object' || !data.stats) {
-                totalEl.textContent = '0';
-                successEl.textContent = '0';
-                failureEl.textContent = '0';
-                averageEl.textContent = '0';
-                modeIndicator.textContent = defaultAnonymousMode ? '匿名模式' : '非匿名模式';
-                renderRequests([]);
-                renderTokens([], { tokens: [] });
-                return;
-            }
-            const stats = data.stats || {};
-            const anonymous = typeof data.anonymous_mode === 'boolean' ? data.anonymous_mode : defaultAnonymousMode;
-            totalEl.textContent = stats.total_requests !== undefined ? stats.total_requests : 0;
-            successEl.textContent = stats.success_requests !== undefined ? stats.success_requests : 0;
-            failureEl.textContent = stats.failure_requests !== undefined ? stats.failure_requests : 0;
-            averageEl.textContent = stats.average_response_time !== undefined ? stats.average_response_time : 0;
-            modeIndicator.textContent = anonymous ? '匿名模式' : '非匿名模式';
-            renderRequests(Array.isArray(data.recent_requests) ? data.recent_requests : []);
-            renderTokens(data.token_stats, data.token_pool || { tokens: [] });
-        }
+            const payload = data || initialData || {};
+            const stats = payload.stats || {};
+            const recentRequests = payload.recent_requests || [];
+            const tokenStats = payload.token_stats || [];
+            const pool = payload.token_pool || { tokens: [] };
 
-        function scheduleRefresh(enabled) {
-            if (timer) {
-                clearInterval(timer);
-                timer = null;
-            }
-            if (enabled) {
-                timer = setInterval(fetchOverview, 5000);
-            }
+            totalEl.textContent = formatNumber(stats.total_requests);
+            successEl.textContent = formatNumber(stats.success_requests);
+            failureEl.textContent = formatNumber(stats.failure_requests);
+            averageEl.textContent = formatNumber(stats.average_response_time);
+
+            requestsBody.innerHTML = recentRequests.map(item => `
+                <tr>
+                    <td>${formatTimestamp(item.timestamp)}</td>
+                    <td>${item.method}</td>
+                    <td>${item.path}</td>
+                    <td>${item.status_code ?? '-'}</td>
+                    <td>${item.duration_ms ?? 0}</td>
+                    <td>${item.client_ip || '-'}</td>
+                    <td>${item.token || '-'}</td>
+                </tr>
+            `).join('');
+
+            tokensBody.innerHTML = (pool.tokens || []).map(item => `
+                <tr>
+                    <td>${item.display}</td>
+                    <td>${(tokenStats.find(stat => stat.token_id === item.token_id) || {}).source || '-'}</td>
+                    <td>${(tokenStats.find(stat => stat.token_id === item.token_id) || {}).success || 0}</td>
+                    <td>${(tokenStats.find(stat => stat.token_id === item.token_id) || {}).failure || 0}</td>
+                    <td>${item.disabled ? '<span class="badge danger">禁用</span>' : '<span class="badge success">正常</span>'}</td>
+                    <td>${item.cooldown_seconds ?? 0}</td>
+                    <td>
+                        <button type="button" data-token-id="${item.token_id}">移除</button>
+                    </td>
+                </tr>
+            `).join('');
+
+            modeIndicator.textContent = payload.anonymous_mode ? '匿名模式' : '非匿名模式';
         }
 
         async function fetchOverview() {
@@ -1069,9 +903,6 @@ DASHBOARD_TEMPLATE = """
                     window.location.href = '/dashboard';
                     return;
                 }
-                if (!res.ok) {
-                    throw new Error(`HTTP ${res.status}`);
-                }
                 const data = await res.json();
                 applyOverview(data);
                 lastUpdated.textContent = `更新于 ${new Date().toLocaleTimeString()}`;
@@ -1079,6 +910,16 @@ DASHBOARD_TEMPLATE = """
                 console.error('刷新仪表盘失败', err);
                 lastUpdated.textContent = '刷新失败，稍后自动重试';
                 applyOverview(null);
+            }
+        }
+
+        function scheduleRefresh(enabled) {
+            if (timer) {
+                clearInterval(timer);
+                timer = null;
+            }
+            if (enabled) {
+                timer = setInterval(fetchOverview, 5000);
             }
         }
 
@@ -1198,73 +1039,90 @@ DASHBOARD_LOGIN_TEMPLATE = """
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
     <title>登录仪表盘</title>
     <style>
+        :root { color-scheme: dark; }
         body {
             margin: 0;
+            font-family: 'Inter', 'PingFang SC', system-ui, -apple-system, sans-serif;
+            background: radial-gradient(circle at top, rgba(34, 211, 238, 0.18), transparent 55%), #020617;
+            color: #e2e8f0;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            background: radial-gradient(circle at top, rgba(34, 211, 238, 0.18), transparent 55%), #0b0f1a;
-            font-family: 'Inter', 'PingFang SC', system-ui, sans-serif;
-            color: #f8fafc;
         }
-        form {
-            width: min(360px, 90vw);
-            background: rgba(15, 23, 42, 0.85);
+        .card {
+            background: rgba(15, 23, 42, 0.92);
             border: 1px solid rgba(148, 163, 184, 0.25);
-            border-radius: 16px;
-            padding: 32px 28px;
-            box-shadow: 0 18px 36px rgba(8, 15, 28, 0.55);
+            border-radius: 18px;
+            padding: 36px;
+            width: min(420px, 92%);
+            box-shadow: 0 28px 60px rgba(15, 23, 42, 0.45);
         }
-        h1 { margin: 0 0 24px; font-size: 22px; text-align: center; }
-        label { display: block; font-size: 14px; margin-bottom: 8px; color: #cbd5f5; }
-        input[type=password] {
+        h1 {
+            margin: 0;
+            font-size: 26px;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+        p {
+            margin: 12px 0 24px;
+            font-size: 15px;
+            color: #94a3b8;
+        }
+        input[type="password"], input[type="text"] {
             width: 100%;
             padding: 12px 14px;
-            border-radius: 10px;
+            border-radius: 12px;
             border: 1px solid rgba(148, 163, 184, 0.25);
             background: rgba(15, 23, 42, 0.65);
-            color: #f8fafc;
+            color: inherit;
             font-size: 15px;
+            transition: border 0.2s ease;
+        }
+        input:focus {
             outline: none;
+            border-color: rgba(56, 189, 248, 0.65);
+            box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
         }
         button {
             width: 100%;
-            margin-top: 20px;
+            margin-top: 18px;
             padding: 12px;
-            border-radius: 10px;
             border: none;
-            font-size: 15px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #38bdf8, #22d3ee);
+            color: #0f172a;
             font-weight: 600;
+            font-size: 15px;
             cursor: pointer;
-            background: linear-gradient(135deg, #22d3ee, #818cf8);
-            color: #0b1120;
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+        }
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 20px 40px rgba(56, 189, 248, 0.35);
         }
         .error {
-            margin-top: 12px;
-            padding: 10px;
+            margin-top: 16px;
+            padding: 10px 14px;
             border-radius: 10px;
-            background: rgba(248, 113, 113, 0.18);
-            color: #fecaca;
-            font-size: 13px;
+            background: rgba(248, 113, 113, 0.12);
+            color: #f87171;
+            font-size: 14px;
         }
-        .hint { margin-top: 16px; font-size: 13px; color: #94a3b8; text-align: center; }
     </style>
 </head>
 <body>
-    <form method=\"post\">
-        <h1>登录监控面板</h1>
-        {% if error %}<div class=\"error\">{{ error }}</div>{% endif %}
-        {% if not auth_required %}<div class=\"hint\">当前未设置 AUTH_TOKEN，将直接访问面板。</div>{% endif %}
-        {% if auth_required %}
-        <label for=\"password\">访问密码 (AUTH_TOKEN)</label>
-        <input type=\"password\" id=\"password\" name=\"password\" placeholder=\"请输入 AUTH_TOKEN\" autocomplete=\"current-password\" required />
-        <button type=\"submit\">登录</button>
-        {% else %}
-        <button type=\"submit\">进入仪表盘</button>
+    <div class=\"card\">
+        <h1>验证访问权限</h1>
+        <p>请输入访问口令，以登录 Z.ai 2 API 仪表盘。</p>
+        <form method=\"post\">
+            <input type=\"password\" name=\"token\" placeholder=\"访问口令\" autocomplete=\"current-password\" required />
+            <button type=\"submit\">登录仪表盘</button>
+        </form>
+        {% if error %}
+        <div class=\"error\">{{ error }}</div>
         {% endif %}
-        <div class=\"hint\">需要通过 AUTH_TOKEN 保护仪表盘安全。</div>
-    </form>
+    </div>
 </body>
 </html>
 """
@@ -1378,26 +1236,20 @@ def _build_model_variant_config(definitions: Dict[str, Dict[str, Any]]) -> Dict[
 
                 thinking_features = dict(base_features)
                 thinking_features["enable_thinking"] = True
-
-                thinking_mcp_servers = meta.get("thinking_mcp_servers")
-                if thinking_mcp_servers is None:
-                        thinking_mcp_servers = base_entry["mcp_servers"]
-
-                config[f"{alias}-Thinking"] = {
+                thinking_entry = {
                         "upstream_id": upstream_id,
                         "description": meta.get("thinking_description") or f"{alias} 思考模型",
                         "features": thinking_features,
-                        "mcp_servers": list(thinking_mcp_servers),
+                        "mcp_servers": list(base_entry["mcp_servers"]),
                 }
+                config[f"{alias}-Thinking"] = thinking_entry
 
                 search_features = dict(base_features)
                 search_features["web_search"] = True
                 search_features["auto_web_search"] = True
-
-                search_mcp_servers = meta.get("search_mcp_servers")
-                if search_mcp_servers is None:
-                        search_mcp_servers = DEFAULT_SEARCH_MCP_SERVERS
-
+                search_mcp_servers = set(base_entry["mcp_servers"] or [])
+                if not search_mcp_servers:
+                        search_mcp_servers = set(DEFAULT_SEARCH_MCP_SERVERS)
                 config[f"{alias}-Search"] = {
                         "upstream_id": upstream_id,
                         "description": meta.get("search_description") or f"{alias} 搜索模型",
@@ -1410,15 +1262,33 @@ def _build_model_variant_config(definitions: Dict[str, Dict[str, Any]]) -> Dict[
 
 MODEL_VARIANT_CONFIG = _build_model_variant_config(BASE_MODEL_VARIANT_DEFINITIONS)
 
+for upstream_id, alias in MODEL_ID_ALIAS_SOURCE.items():
+        cfg.model.mapping[upstream_id] = alias.lower()
+
+
+# tiktoken 预加载
+cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
+os.environ["TIKTOKEN_CACHE_DIR"] = cache_dir
+assert os.path.exists(os.path.join(cache_dir, "9b5ad71b2ce5302211f9c61530b329a4922fc6a4")) # cl100k_base.tiktoken
+import tiktoken
+enc = tiktoken.get_encoding("cl100k_base")
 # 日志
-logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+        level=logging.DEBUG if cfg.api.debug_msg else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+)
 log = logging.getLogger(__name__)
 
-def debug(msg, *args):
-        if DEBUG_MODE: log.debug(msg, *args)
+DEBUG_MODE = cfg.api.debug_msg
+
+
+def debug(message: str, *args: Any):
+        if DEBUG_MODE:
+                log.debug(message, *args)
 
 # Flask 应用
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
 app.secret_key = SECRET_KEY
 app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
 app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
@@ -1429,98 +1299,111 @@ phaseBak = "thinking"
 @app.before_request
 def _setup_request_context():
         g.current_token_info = {"token": None, "source": "none"}
-
-
 # 工具函数
 class utils:
         @staticmethod
         class request:
+                _user_cache: Dict[str, Dict[str, Any]] = {}
+
+                @classmethod
+                def headers(cls) -> Dict[str, str]:
+                        return {
+                                "Accept": "*/*",
+                                "Accept-Language": "zh-CN,zh;q=0.9",
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "Origin": f"{cls.source.protocol}//{cls.source.host}",
+                                "Pragma": "no-cache",
+                                "Referer": f"{cls.source.protocol}//{cls.source.host}/",
+                                "Sec-Ch-Ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+                                "Sec-Ch-Ua-Mobile": "?0",
+                                "Sec-Ch-Ua-Platform": '"Windows"',
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-origin",
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
+                                "X-FE-Version": "prod-fe-1.0.98",
+                        }
+
+                @staticmethod
+                def _last_user_message(messages: Any) -> str:
+                        if not isinstance(messages, list):
+                                return ""
+                        for message in reversed(messages):
+                                if not isinstance(message, dict):
+                                        continue
+                                if message.get("role") not in {"user", "human"}:
+                                        continue
+                                content = message.get("content")
+                                if isinstance(content, str):
+                                        return content
+                                if isinstance(content, list):
+                                        parts: List[str] = []
+                                        for item in content:
+                                                if not isinstance(item, dict):
+                                                        continue
+                                                if item.get("type") == "text" and item.get("text"):
+                                                        parts.append(item.get("text", ""))
+                                                elif item.get("type") == "input_text" and item.get("input_text"):
+                                                        parts.append(item.get("input_text", ""))
+                                        if parts:
+                                                return "".join(parts)
+                        return ""
+
                 @staticmethod
                 def chat(data, chat_id):
-                        debug("收到请求: %s", json.dumps(data))
-                        token = utils.request.token()
-                        headers = {**BROWSER_HEADERS, "Referer": f"{BASE}/c/{chat_id}"}
-                        if token:
-                                headers["Authorization"] = f"Bearer {token}"
+                        timestamp = int(datetime.now().timestamp() * 1000)
+                        request_id = str(uuid.uuid4())
+
+                        user = utils.request.user()
+                        user_token = user.get("token")
+                        user_id = user.get("id")
+
                         params = {
-                                "requestId": str(uuid.uuid4()),
-                                "timestamp": str(int(time.time() * 1000)),
-                                "user_id": str(uuid.uuid4()),
+                                "timestamp": timestamp,
+                                "requestId": request_id,
                         }
-                        e = "requestId,{request_id},timestamp,{timestamp},user_id,{user_id}".format(
-                                request_id=params["requestId"],
-                                timestamp=int(params["timestamp"]),
-                                user_id=params["user_id"],
-                        )
-                        t = _extract_signature_prompt(data.get("messages"))
-                        signature_payload = generate_signature(e, t)
-                        params["signature_timestamp"] = str(signature_payload["timestamp"])
-                        headers["X-Signature"] = signature_payload["signature"]
-                        url = f"{BASE}/api/chat/completions"
+                        headers = {
+                                **cfg.headers(),
+                                "Content-Type": "application/json",
+                                "Referer": f"{BASE_URL}/c/{chat_id}"
+                        }
+                        if user_token:
+                                headers["Authorization"] = f"Bearer {user_token}"
+
+                        if user_id:
+                                params["user_id"] = user_id
+                                last_user_message = utils.request._last_user_message(data.get("messages", []))
+                                try:
+                                        signatures = utils.request.signature(
+                                                {
+                                                        "requestId": request_id,
+                                                        "timestamp": timestamp,
+                                                        "user_id": user_id,
+                                                },
+                                                last_user_message,
+                                        )
+                                        headers["X-Signature"] = signatures.get("signature")
+                                        params["signature_timestamp"] = signatures.get("timestamp")
+                                        data["signature_prompt"] = last_user_message
+                                except Exception as exc:
+                                        debug("签名生成失败: %s", exc)
+
+                        url = f"{BASE_URL}/api/chat/completions"
+                        if params:
+                                query_string = urllib.parse.urlencode(params)
+                                url = f"{url}?{query_string}"
+
+                        token_info = dict(getattr(g, "current_token_info", {}) or {})
                         start_time = time.perf_counter()
+                        recorded = False
                         try:
                                 response = requests.post(
                                         url,
                                         json=data,
                                         headers=headers,
-                                        params=params,
                                         stream=True,
-                                        timeout=60
-                                )
-                        except Exception as e:
-                                duration = time.perf_counter() - start_time
-                                _record_upstream_metrics(
-                                        method="POST",
-                                        url=url,
-                                        status_code=None,
-                                        duration=duration,
-                                        error=str(e),
-                                )
-                                if token_pool.contains(token):
-                                        token_pool.mark_failure(token)
-                                raise e
-
-                        response._metrics_context = {
-                                "start_time": start_time,
-                                "url": url,
-                                "method": "POST",
-                                "token": token,
-                                "token_info": dict(getattr(g, "current_token_info", {}) or {}),
-                                "finalized": False,
-                        }
-                        return response
-                @staticmethod
-                def image(data_url, chat_id):
-                        try:
-                                if ANONYMOUS_MODE or not data_url.startswith("data:"):
-                                        return None
-
-                                header, encoded = data_url.split(",", 1)
-                                mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
-
-                                image_data = base64.b64decode(encoded) # 解码数据
-
-                                extension = mimetypes.guess_extension(mime_type) or ""
-                                if extension == ".jpe":
-                                        extension = ".jpg"
-                                if not extension and mime_type.startswith("image/"):
-                                        extension = f".{mime_type.split('/', 1)[1]}"
-                                filename = f"{uuid.uuid4()}{extension}"
-
-                                debug("上传文件：%s", filename)
-                                token = utils.request.token(prefer_pool=True)
-                                headers = {**BROWSER_HEADERS, "Referer": f"{BASE}/c/{chat_id}"}
-                                if token:
-                                        headers["Authorization"] = f"Bearer {token}"
-
-                                url = f"{BASE}/api/v1/files/"
-                                start_time = time.perf_counter()
-                                recorded = False
-                                response = requests.post(
-                                        url,
-                                        files={"file": (filename, image_data, mime_type)},
-                                        headers=headers,
-                                        timeout=30
+                                        timeout=60,
                                 )
                                 duration = time.perf_counter() - start_time
                                 _record_upstream_metrics(
@@ -1528,6 +1411,75 @@ class utils:
                                         url=url,
                                         status_code=response.status_code,
                                         duration=duration,
+                                        token_info=token_info,
+                                )
+                                recorded = True
+                                response._metrics_context = {
+                                        "start_time": start_time,
+                                        "url": url,
+                                        "method": "POST",
+                                        "token": token_info.get("token"),
+                                        "token_info": token_info,
+                                        "finalized": False,
+                                }
+                                return response
+                        except Exception as exc:
+                                if not recorded:
+                                        duration = time.perf_counter() - start_time
+                                        _record_upstream_metrics(
+                                                method="POST",
+                                                url=url,
+                                                status_code=None,
+                                                duration=duration,
+                                                error=str(exc),
+                                                token_info=token_info,
+                                        )
+                                if token_pool.contains(token_info.get("token")):
+                                        token_pool.mark_failure(token_info.get("token"))
+                                raise
+
+                @staticmethod
+                def image(data_url, chat_id):
+                        if cfg.api.anon or not isinstance(data_url, str) or not data_url.startswith("data:"):
+                                return None
+
+                        header, encoded = data_url.split(",", 1)
+                        mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
+
+                        image_data = base64.b64decode(encoded)
+                        extension = mimetypes.guess_extension(mime_type) or ""
+                        if extension == ".jpe":
+                                extension = ".jpg"
+                        if not extension and mime_type.startswith("image/"):
+                                extension = f".{mime_type.split('/', 1)[1]}"
+                        filename = f"{uuid.uuid4()}{extension}"
+
+                        debug("上传文件：%s", filename)
+                        token = utils.request.token(prefer_pool=True)
+                        headers = {
+                                **cfg.headers(),
+                                "Referer": f"{BASE_URL}/c/{chat_id}"
+                        }
+                        if token:
+                                headers["Authorization"] = f"Bearer {token}"
+
+                        url = f"{BASE_URL}/api/v1/files/"
+                        start_time = time.perf_counter()
+                        recorded = False
+                        try:
+                                response = requests.post(
+                                        url,
+                                        files={"file": (filename, image_data, mime_type)},
+                                        headers=headers,
+                                        timeout=30,
+                                )
+                                duration = time.perf_counter() - start_time
+                                _record_upstream_metrics(
+                                        method="POST",
+                                        url=url,
+                                        status_code=response.status_code,
+                                        duration=duration,
+                                        token_info=dict(getattr(g, "current_token_info", {}) or {}),
                                 )
                                 recorded = True
 
@@ -1539,24 +1491,26 @@ class utils:
 
                                 if response.status_code == 200:
                                         result = response.json()
-                                        return f"{result.get("id")}_{result.get("filename")}"
-                                else:
-                                        raise Exception(response.text)
-                        except Exception as e:
-                                if 'start_time' in locals() and not recorded:
+                                        return f"{result.get('id')}_{result.get('filename')}"
+                                debug("图片上传失败: %s", response.text)
+                        except Exception as exc:
+                                if not recorded:
                                         duration = time.perf_counter() - start_time
                                         _record_upstream_metrics(
                                                 method="POST",
                                                 url=url,
                                                 status_code=None,
                                                 duration=duration,
-                                                error=str(e),
+                                                error=str(exc),
+                                                token_info=dict(getattr(g, "current_token_info", {}) or {}),
                                         )
-                                debug("图片上传失败: %s", e)
+                                debug("图片上传失败: %s", exc)
                         return None
+
                 @staticmethod
                 def id(prefix = "msg") -> str:
-                        return f"{prefix}-{int(datetime.now().timestamp()*1e9)}"
+                        return str(uuid.uuid4())
+
                 @staticmethod
                 def token(prefer_pool: bool = True) -> str:
                         token: Optional[str] = None
@@ -1571,31 +1525,296 @@ class utils:
                                         debug("使用池中令牌: %s...", token[:10])
                                         return token
 
-                        if not ANONYMOUS_MODE and TOKEN:
+                        if not cfg.api.anon and cfg.source.token:
                                 source = "static"
-                                g.current_token_info = {"token": TOKEN, "source": source}
-                                return TOKEN
+                                g.current_token_info = {"token": cfg.source.token, "source": source}
+                                return cfg.source.token
 
                         try:
-                                r = requests.get(f"{BASE}/api/v1/auths/", headers=BROWSER_HEADERS, timeout=8)
-                                token = r.json().get("token")
+                                headers = {**cfg.headers(), "Content-Type": "application/json"}
+                                response = requests.get(f"{BASE_URL}/api/v1/auths/", headers=headers, timeout=8)
+                                data = response.json()
+                                token = data.get("token")
                                 if token:
                                         source = "anonymous"
                                         g.current_token_info = {"token": token, "source": source}
+                                        g.current_user_info = {
+                                                "token": token,
+                                                "id": data.get("id"),
+                                                "name": data.get("name"),
+                                        }
+                                        utils.request._user_cache[token] = {
+                                                "id": data.get("id"),
+                                                "name": data.get("name"),
+                                        }
                                         debug("获取匿名令牌: %s...", token[:15])
                                         return token
-                        except Exception as e:
-                                debug("匿名令牌获取失败: %s", e)
+                        except Exception as exc:
+                                debug("匿名令牌获取失败: %s", exc)
 
-                        fallback_token = TOKEN or token
+                        fallback_token = cfg.source.token or token
                         if fallback_token:
-                                source = "static" if fallback_token == TOKEN else "anonymous"
+                                source = "static" if fallback_token == cfg.source.token else "anonymous"
                         else:
                                 source = "anonymous"
                         g.current_token_info = {"token": fallback_token, "source": source}
                         return fallback_token or ""
+
                 @staticmethod
-                def response(resp):
+                def user(prefer_pool: bool = True):
+                        existing = getattr(g, "current_user_info", None)
+                        if existing and existing.get("token"):
+                                return existing
+
+                        token = utils.request.token(prefer_pool=prefer_pool)
+                        info = getattr(g, "current_user_info", None)
+                        if info and info.get("token") == token:
+                                return info
+
+                        if not token:
+                                info = {"token": "", "id": None, "name": None}
+                                g.current_user_info = info
+                                return info
+
+                        cached = utils.request._user_cache.get(token)
+                        if cached:
+                                info = {"token": token, "id": cached.get("id"), "name": cached.get("name")}
+                                g.current_user_info = info
+                                return info
+
+                        headers = {**cfg.headers(), "Content-Type": "application/json"}
+                        if token:
+                                headers["Authorization"] = f"Bearer {token}"
+
+                        try:
+                                response = requests.get(f"{BASE_URL}/api/v1/auths/", headers=headers, timeout=8)
+                                if response.status_code == 200:
+                                        data = response.json()
+                                        info = {
+                                                "token": token,
+                                                "id": data.get("id"),
+                                                "name": data.get("name"),
+                                        }
+                                        utils.request._user_cache[token] = {
+                                                "id": data.get("id"),
+                                                "name": data.get("name"),
+                                        }
+                                        g.current_user_info = info
+                                        return info
+                        except Exception as exc:
+                                debug("获取用户信息失败: %s", exc)
+
+                        info = {"token": token, "id": None, "name": None}
+                        g.current_user_info = info
+                        return info
+
+        @staticmethod
+        def signature(prarms: Dict, content: str) -> Dict:
+            for param in ["timestamp", "requestId", "user_id"]:
+                if param not in prarms or not prarms.get(param):
+                    raise ValueError(f"need prarm: {param}")
+
+            def _hmac_sha256(key: bytes, msg: bytes):
+                return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+            # content = content.strip()
+            request_time = int(prarms.get("timestamp", datetime.now().timestamp() * 1000))  # 请求时间戳（毫秒）
+
+            # 第 1 级签名
+            signature_expire = request_time // (5 * 60 * 1000)  # 5 分钟粒度
+            signature_1_plaintext = str(signature_expire)
+            signature_1 = _hmac_sha256(b"junjie", signature_1_plaintext.encode('utf-8'))
+
+            # 第 2 级签名
+            content = base64.b64encode(content.encode('utf-8')).decode('ascii')
+
+            signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
+            signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
+            signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
+
+            # .......:.---*==**==+===-=-::.....   .::::.:.................:::.:-::-:-::.  
+            # .....:.::==:+--==--=---:-=:::..  .-=+++*+++++=-:.   ......:.::::.:-:----:.      
+            # ...:.....::--::-----::::.::::. .-+*************++-:. .::..:.:::-::----=-::.     
+            # ........:..:.:-=-----::::::...:+++************+++++-. ..:::.:::---:=====-..        
+            # .......:.::::=-=-----:::::::..=*++++**********+++++=:  .-::::::--=--++++=..      .
+            # ......::..:::=-=-----::-*-=:.:=*+++++==+++=+====+===:..::.::--::--==++++=:.    ..  
+            # ........:-:::::---::::-:=::: -+=+++==++=++======++==-...===:.:-----=+*+==:..       
+            # . ..:++++*--=-=##+*=::-::::--=************++*+++*+==-.:.-:-:.:::---=+%%%%=..      .
+            #   ...:-=:.::::-%#=-:...::.:=++****#*******++**#***++-:-:-+-:==:..:--*%@@@*.... .:--
+            # ..::::::::--:::=---::::::..+*+*******+===::-+*****+=::---=--::.:::----=++=-::::.-==
+            # ::::::::::::---:-:::-:--:---*++***+*****+==+++++++==::=-------=--------------------
+            # :::::::::---------------: .:+++***++=++*+*+=-=++++=--==============================
+            # :::::--------------------::--=+****: .:...:. -+*++-================================
+            # ::::--------------------------==***+-+*+++-:-+*+=-=++=++++==++===============++====
+            # ----------------------------===-=*#**++**+++***--..-=++++++++++++++++++++++++++++++
+            # --------------------============--+**********+-:-.   :+++++++++++++++++++++++++++=+
+            # ------------------=============-. .-=++++++=-::--:    .=+*++++++++++++++++++======+
+            # --------====------===========-:...::..:-:::::::---   ...:=+++++++++++++++++++++++==
+            # -------=================---:......-=::=+==+=-::--:........-=+**++++++++++++++++++++
+            # --------==--========--::......... :++++*++**=:::::=-........:-=++++++++++++++++++++
+            # -----=---====----::.............:--+********+=-:==:.............:::-=++++++++--++==
+            # ======.:.:=---=-........ .....:=+**+**###*****++=:...................-+*++**+*+++++
+            # ======:.-----==:....... ......-*******##********++=....................-++++++:-+++
+            # +++++*+++*+++-................=*******************+:....................=*+*+++++++
+            # +++++++++++*-................-+********************-................... -*+++++++++
+            # +++++++++++*-...............:=+********************-..............::::..=++++++++++
+            # ++++++++++++=...............:=+********************-...............:---:-++++++++++
+            # +++++++++++*= ............   .-*******************=..:...................++++++++++
+            # +++++++**++=:........  .....  -*++**************+=: .....................-+++++++++
+            # +++++++=-:....................=*+=+++++=++******=:   ....--...............-++++++++
+            # ++++++-......................:***+==---::-==+===-........::.. .............=+++++++
+            # ++++++........................***+=-::.. .:-----:.:-..... .................:+======
+            # +++++=........................-==-:..     ...::...:-........................-++++++
+            # ++++++..........................          .      ............................:+++++
+            # ++++++.........................        .....        .........................:+++++
+            # ++++++: ........................  ...........    ............................-*++++
+            # +++++*- ........................  ............   ............ ...............=+++++
+            # 哎呀！哎呀！哎呀呀呀！
+            # 哎↘呀哎↘↗呀哎呀呀呀
+            # junjie，jun 总啊！
+            # 您怎么就改了签名算法啊哎呀！
+            # 哎呀哎呀哎呀呀呀呀呀
+            # 太感谢我 jun 总了呀呀呀呀
+            # 太性情 太感谢 太通透了
+            # 直接就宣判了啊！
+            # 这可是带 hmac 的签名算法
+            # 砸到小户身上脸都是疼的~
+            # 祝开发此签名的开发者
+            # 学业工作都顺利
+            # 用苹果手机
+            # 开苹果汽车
+            # 住苹果房子
+            # 享苹果人生
+            # 你必定是
+            # 开兰博基尼
+            # 坐私人飞机
+            # 同时也祝您和您的家里人
+            # 身体健康
+            # 事业顺利
+            # 家庭幸福
+            # 在以后的人生里
+            # 购买力越来越苹果爆赞👍
+
+            log.debug("生成签名: %s", signature_2)
+            log.debug("  请求时间: %s", prarms.get("timestamp"))
+            log.debug("  请求标识: %s", prarms.get("requestId"))
+            log.debug("  用户标识: %s", prarms.get("user_id"))
+            log.debug("  最后内容: %s", content[:50])
+            return {
+                "signature": signature_2,
+                "timestamp": request_time
+            }
+
+        _models_cache = {}
+        @staticmethod
+        def models() -> Dict:
+            """获取模型列表"""
+            current_token = utils.request.user().get('token') if cfg.api.anon else cfg.source.token
+
+            if utils.request._models_cache:
+                return utils.request._models_cache
+
+            def format_model_name(name: str) -> str:
+                """格式化模型名"""
+                if not name:
+                    return ""
+                parts = name.split('-')
+                if len(parts) == 1:
+                    return parts[0].upper()
+                formatted = [parts[0].upper()]
+                for p in parts[1:]:
+                    if not p:
+                        formatted.append("")
+                    elif p.isdigit():
+                        formatted.append(p)
+                    elif any(c.isalpha() for c in p):
+                        formatted.append(p.capitalize())
+                    else:
+                        formatted.append(p)
+                return "-".join(formatted)
+
+            def get_model_name(source_id: str, model_name: str) -> str:
+                """获取模型名称：优先自带，其次智能生成"""
+
+                # 处理自带系列名的模型名称
+                if source_id.startswith(("GLM", "Z")) and "." in source_id:
+                    return source_id
+
+                if model_name.startswith(("GLM", "Z")) and "." in model_name:
+                    return model_name
+
+                # 无法识别系列名，但名称仍为英文
+                if not model_name or not ('A' <= model_name[0] <= 'Z' or 'a' <= model_name[0] <= 'z'):
+                    model_name = format_model_name(source_id)
+                    if not model_name.upper().startswith(("GLM", "Z")): model_name = model_name = "GLM-" + format_model_name(source_id)
+
+                return model_name
+
+            def get_model_id(source_id: str, model_name: str) -> str:
+                """获取模型 ID：优先配置，其次智能生成"""
+                if hasattr(cfg.model, 'mapping') and source_id in cfg.model.mapping:
+                    return cfg.model.mapping[source_id]
+
+                # 找不到配置则生成智能 ID
+                smart_id = model_name.lower()
+                cfg.model.mapping[source_id] = smart_id
+                return smart_id
+
+            headers = {
+                **cfg.headers(),
+                "Authorization": f"Bearer {current_token}",
+                "Content-Type": "application/json"
+            }
+            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                models = []
+                for m in data.get("data", []):
+                    if not m.get("info", {}).get("is_active", True):
+                        continue
+                    model_id = m.get("id")
+                    model_name = m.get("name")
+                    model_info = m.get("info", {})
+                    model_meta = model_info.get("meta", {})
+                    model_logo = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2030%2030%22%20style%3D%22background%3A%232D2D2D%22%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M15.47%207.1l-1.3%201.85c-.2.29-.54.47-.9.47h-7.1V7.09c0%20.01%209.31.01%209.31.01z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M24.3%207.1L13.14%2022.91H5.7l11.16-15.81z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M14.53%2022.91l1.31-1.86c.2-.29.54-.47.9-.47h7.09v2.33h-9.3z%22%2F%3E%3C%2Fsvg%3E"
+
+                    model_meta_r = {
+                        "profile_image_url": model_logo,
+                        "capabilities": model_meta.get("capabilities"),
+                        "description": model_meta.get("description"),
+                        "hidden": model_meta.get("hidden"),
+                        "suggestion_prompts": [{"content": item["prompt"]} for item in (model_meta.get("suggestion_prompts") or []) if isinstance(item, dict) and "prompt" in item]
+                    }
+                    models.append({
+                        "id": get_model_id(model_id, get_model_name(model_id, model_name)),
+                        "object": "model",
+                        "name": get_model_name(model_id, model_name),
+                        "meta": model_meta_r,
+                        "info": {
+                            "meta": model_meta_r
+                        },
+                        "created": model_info.get("created_at", int(datetime.now().timestamp())),
+                        "owned_by": "z.ai",
+                        "orignal": {
+                            "name": model_name,
+                            "id": model_id,
+                            "info": model_info
+                        },
+                        # Special For Open WebUI
+                        # So, Fuck you! Private!
+                        "access_control": None,
+                    })
+                result = {
+                    "object": "list",
+                    "data": models,
+                }
+                utils.request._models_cache = result
+                return result
+            else:
+                raise Exception(f"fetch models info fail: {response.text}")
+
+        @staticmethod
+        def response(resp):
                         try:
                                 origin = request.headers.get("Origin", "").strip()
                         except Exception:
@@ -1619,684 +1838,894 @@ class utils:
                                 "Vary": ", ".join(sorted(vary_values)),
                         })
                         return resp
+
         @staticmethod
-        class response:
-                @staticmethod
-                def parse(stream):
-                        for line in stream.iter_lines():
-                                if not line or not line.startswith(b"data: "): continue
-                                try: data = json.loads(line[6:].decode("utf-8", "ignore"))
-                                except: continue
-                                yield data
-                @staticmethod
-                def format(data):
-                        data = data.get("data", "")
-                        if not data: return None
-                        phase = data.get("phase", "other")
-                        content = data.get("delta_content") or data.get("edit_content") or ""
-                        if not content: return None
-                        contentBak = content
-                        global phaseBak
-                        if phase == "thinking" or (phase == "answer" and "summary>" in content):
-                                content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
-                                content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
+        def format(data: Dict, type: str = "OpenAI"):
+            odata = {**data.copy()}
+            new_messages = []
+            chat_id = odata.get("chat_id")
+            model = odata.get("model", cfg.model.default)
 
-                                if phase == "thinking":
-                                        content = re.sub(r'\n*<summary>.*?</summary>\n*', '\n\n', content)
+            models = utils.request.models() # 请求模型信息，以获取映射设置
+            # 如果找到了映射设置
+            if hasattr(cfg.model, 'mapping') and model:
+                # 在映射中查找值等于当前模型的键
+                for source_id, mapped_id in cfg.model.mapping.items():
+                    if mapped_id == model and model != source_id:
+                        # 找到匹配，将 model 改为源 ID（键名）
+                        log.debug(f"模型映射: {model} -> {source_id}")
+                        model = source_id
+                        break
 
-                                # 以 <reasoning> 为基底
-                                content = re.sub(r"<details[^>]*>\n*", "<reasoning>\n\n", content)
-                                content = re.sub(r"\n*</details>", "\n\n</reasoning>", content)
+            # Anthropic - system 转换 role:system
+            if "system" in odata:
+                systems = odata["system"]
+                if isinstance(systems, str):
+                    content = systems.lstrip('\n')
+                else:
+                    items = []
+                    for item in systems:
+                        if item.get("type") == "text": items.append(item.get("text", "").lstrip('\n'))
+                    content = "\n\n".join(items)
+                new_messages.append({"role": "system", "content": content})
+                del odata["system"]
 
-                                if phase == "answer":
-                                        match = re.search(r"(?s)^(.*?</reasoning>)(.*)$", content) # 判断 </reasoning> 后是否有内容
-                                        if match:
-                                                before, after = match.groups()
-                                                if after.strip():
-                                                        # </reasoning> 后有内容
-                                                        if phaseBak == "thinking":
-                                                                # 思考休止 → 结束思考，加上回答
-                                                                content = f"\n\n</reasoning>\n\n{after.lstrip('\n')}"
-                                                        elif phaseBak == "answer":
-                                                                # 回答休止 → 清除所有
-                                                                content = ""
-                                                else:
-                                                        # 思考休止 → </reasoning> 后无内容
-                                                        content = "\n\n</reasoning>"
+            # messages 处理
+            for message in odata.get("messages", []):
+                role = message.get("role")
+                content = message.get("content", [])
+                new_message = {"role": role}
 
-                                if THINK_TAGS_MODE == "reasoning":
-                                        if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
-                                        content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
-                                        content = re.sub(r"<reasoning>\n*", "", content)
-                                        content = re.sub(r"\n*</reasoning>", "", content)
-                                elif THINK_TAGS_MODE == "think":
-                                        if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
-                                        content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
-                                        content = re.sub(r"<reasoning>", "<think>", content)
-                                        content = re.sub(r"</reasoning>", "</think>", content)
-                                elif THINK_TAGS_MODE == "strip":
-                                        content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
-                                        content = re.sub(r"<reasoning>\n*", "", content)
-                                        content = re.sub(r"</reasoning>", "", content)
-                                elif THINK_TAGS_MODE == "details":
-                                        if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
-                                        content = re.sub(r"<reasoning>", "<details type=\"reasoning\" open><div>", content)
-                                        thoughts = ""
-                                        if phase == "answer":
-                                                # 判断是否有 <summary> 内容
-                                                summary_match = re.search(r"(?s)<summary>.*?</summary>", before)
-                                                duration_match = re.search(r'duration="(\d+)"', before)
-                                                if summary_match:
-                                                        # 有内容 → 直接照搬
-                                                        thoughts = f"\n\n{summary_match.group()}"
-                                                # 判断是否有 duration 内容
-                                                elif duration_match:
-                                                        # 有内容 → 通过 duration 生成 <summary>
-                                                        thoughts = f'\n\n<summary>Thought for {duration_match.group(1)} seconds</summary>'
-                                        content = re.sub(r"</reasoning>", f"</div>{thoughts}</details>", content)
-                                else:
-                                        content = re.sub(r"</reasoning>", "</reasoning>\n\n", content)
-                                        debug("警告：THINK_TAGS_MODE 传入了未知的替换模式，将使用 <reasoning> 标签。")
+                # 如果 content 类型是文本
+                if isinstance(content, str):
+                    new_message["content"] = content
+                    new_messages.append(new_message)
+                    continue
 
-                        phaseBak = phase
-                        if repr(content) != repr(contentBak):
-                                debug("R 内容: %s %s", phase, repr(contentBak))
-                                debug("W 内容: %s %s", phase, repr(content))
+                # 如果 content 类型是数组
+                if isinstance(content, list):
+                    dont_append = False
+                    new_content: Union[str, List[Dict[Any, Any]]] = ""
+                    for item in content:
+                        type = item.get("type")
+                        # 如果 消息类型 为 文本
+                        if type == "text":
+                            new_content = item.get("text")
+                            continue
+
+                        # 如果 消息类型 为 图片
+                        elif type == "image_url" or type == "image":
+                            media_url = ""
+                            # 获取 OpenAI 格式下的图片链接
+                            if item.get("image_url", {}).get("url"):
+                                media_url = item.get("image_url").get("url")
+                            # 获取 Anthropic 格式下的图片链接
+                            elif item.get("source", {}).get("data"):
+                                source = item.get("source")
+                                if source.get("type") == "base64" and source.get("data"):
+                                    media_url = f"data:{source.get("media_type", "image/jpeg")};base64,{source.get("data")}"
+
+                            def truncate_values(obj, max_len=20):
+                                if isinstance(obj, dict): return {k: truncate_values(v, max_len) for k, v in obj.items()}
+                                elif isinstance(obj, list): return [truncate_values(x, max_len) for x in obj]
+                                elif isinstance(obj, str): return obj[:max_len]
+                                else: return obj
+
+                            if not media_url:
+                                if isinstance(new_content, str):
+                                    new_content = [{
+                                        "type": "text",
+                                        "text": new_content
+                                    }]
+                                new_content.append({
+                                    "type": "text",
+                                    "text": f"system: image error - Unsupported format or missing URL\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
+                                })
+                                continue
+                            # 将以 data: 编码的图片链接上传到服务器
+                            try:
+                                uploaded_url = utils.request.image(media_url, chat_id)
+                                if uploaded_url: media_url = uploaded_url
+                            except Exception as e:
+                                if isinstance(new_content, str):
+                                    new_content = [{
+                                        "type": "text",
+                                        "text": new_content
+                                    }]
+                                new_content.append({
+                                    "type": "text",
+                                    "text": f"system: image upload error - {e}\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
+                                })
+                                continue
+
+                            if isinstance(new_content, str):
+                                new_content = [{
+                                    "type": "text",
+                                    "text": new_content
+                                }]
+                            new_content.append({
+                                "type": "image_url",
+                                "image_url": {"url": media_url}
+                            })
+
+                        # Anthropic - 如果 消息类型 为 助理 使用工具
+                        elif type == "tool_use" and role == "assistant":
+                            # 如果 tool_calls 为空，初始化为空列表
+                            if new_message.get("tool_calls") is None:
+                                new_message["tool_calls"] = []
+
+                            # 直接追加到 new_msg["tool_calls"]
+                            new_message["tool_calls"].append({
+                                "id": item.get("id"),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name"),
+                                    "arguments": json.dumps(item.get("input", {}) or {}, ensure_ascii=False)
+                                }
+                            })
+                            dont_append = True
+
+                        # Anthropic - 如果 消息类型 为 工具结果
+                        elif type == "tool_result":
+                            tool_result_content = item.get("content", [])
+
+                            # 如果 工具请求结果 类型是数组
+                            if isinstance(tool_result_content, list):
+                                # 提取所有 text 类型的内容并拼接
+                                _parts = []
+                                for _item in tool_result_content:
+                                    if _item.get("type") == "text" and _item.get("text", ""): _parts.append(_item.get("text"))
+                                if _parts:
+                                    result = "".join(_parts)
+                            else:
+                                result = tool_result_content
+
+                            new_messages.append({
+                                "role": "tool",
+                                "tool_call_id": item.get("tool_use_id"),
+                                "content": result
+                            })
+                            dont_append = True
+
+                        # 如果 消息类型 为 其它
                         else:
-                                debug("R 内容: %s %s", phase, repr(contentBak))
+                            if isinstance(new_content, str):
+                                new_content = [{
+                                    "type": "text",
+                                    "text": new_content
+                                }]
+                            new_content.append(item)
 
-                        if phase == "thinking" and THINK_TAGS_MODE == "reasoning":
-                                return {"role": "assistant", "reasoning_content": content}
-                        elif repr(content):
-                                return {"role": "assistant", "content":content}
+                    if not dont_append:
+                        new_message["content"] = new_content
+                        new_messages.append(new_message)
+
+            result = {
+                **odata,
+                "model": model,
+                "messages": new_messages,
+                "stream": True,
+                "features": {
+                    "enable_thinking": False, # 默认思考
+                    **odata.get("features", {})
+                },
+            }
+
+            # Qwen 的开启思考方式
+            if odata.get("enable_thinking"):
+                result["features"]["enable_thinking"] = str(odata.get("enable_thinking", True))
+                odata.pop("enable_thinking", None)
+
+            # Anthropic / CherryStudio-OpenAI 的开启思考方式
+            if odata.get("thinking"):
+                result["features"]["enable_thinking"] = str(odata.get("thinking", {}).get("type", "enabled")).lower() == "enabled"
+                odata.pop("thinking", None)
+
+            if models:
+                for _model in models.get("data", []):
+                    if _model.get("id") == model or _model.get("orignal", {}).get("id") == model:
+                        # 检查该模型是否支持 thinking 能力
+                        if not _model.get("orignal", {}).get("info", {}).get("meta", {}).get("capabilities", {}).get("think", False):
+                            del result["features"]["enable_thinking"]
+                            # 如果 features 为空，删除整个 features 字段
+                            if not result["features"]:
+                                del result["features"]
+                        break
+
+
+            return result
+
+class response:
+        @staticmethod
+        def parse(stream):
+            for line in stream.iter_lines():
+                if not line or not line.startswith(b"data: "): continue
+                try: data = json.loads(line[6:].decode("utf-8", "ignore"))
+                except: continue
+                yield data
+
+        @staticmethod
+        def format(data, type = "OpenAI"):
+            data = data.get("data", "")
+            if not data: return None
+            phase = data.get("phase", "other")
+            content = data.get("delta_content") or data.get("edit_content") or ""
+            if not content: return None
+            contentBak = content
+            global phaseBak
+
+            if phase == "tool_call":
+                content = re.sub(r"\n*<glm_block[^>]*>{\"type\": \"mcp\", \"data\": {\"metadata\": {", "{", content)
+                content = re.sub(r"\", \"result\": \"\".*</glm_block>", "", content)
+            elif phase == "other" and phaseBak == "tool_call" and "glm_block" in content:
+                phase = "tool_call"
+                content = re.sub(r"null, \"display_result\": \"\".*</glm_block>", "\"}", content)
+
+            if phase == "thinking" or (phase == "answer" and "summary>" in content):
+                content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
+                content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
+
+                if phase == "thinking":
+                    content = re.sub(r'\n*<summary>.*?</summary>\n*', '\n\n', content)
+
+                # 以 <reasoning> 为基底
+                content = re.sub(r"<details[^>]*>\n*", "<reasoning>\n\n", content)
+                content = re.sub(r"\n*</details>", "\n\n</reasoning>", content)
+
+                if phase == "answer":
+                    match = re.search(r"(?s)^(.*?</reasoning>)(.*)$", content) # 判断 </reasoning> 后是否有内容
+                    if match:
+                        before, after = match.groups()
+                        if after.strip():
+                            # </reasoning> 后有内容
+                            if phaseBak == "thinking":
+                                # 思考休止 → 结束思考，加上回答
+                                content = f"\n\n</reasoning>\n\n{after.lstrip('\n')}"
+                            elif phaseBak == "answer":
+                                # 回答休止 → 清除所有
+                                content = ""
                         else:
-                                return None
-                @staticmethod
-                def count(text):
-                        return len(enc.encode(text))
+                            # 思考休止 → </reasoning> 后无内容
+                            content = "\n\n</reasoning>"
 
-# 路由
-@app.route("/", methods=["GET"])
-def service_status_page():
-        snapshot = token_pool.snapshot()
-        token_count = snapshot.get("size", 0)
-        return render_template_string(
-                STATUS_PAGE_TEMPLATE,
-                timestamp=datetime.now().isoformat(timespec="seconds"),
-                anonymous_mode=ANONYMOUS_MODE,
-                token_count=token_count,
-                requires_auth=bool(AUTH_TOKEN),
-        )
+                if cfg.api.think == "reasoning":
+                    if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
+                    content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
+                    content = re.sub(r"<reasoning>\n*", "", content)
+                    content = re.sub(r"\n*</reasoning>", "", content)
+                elif cfg.api.think == "think":
+                    if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
+                    content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
+                    content = re.sub(r"<reasoning>", "<think>", content)
+                    content = re.sub(r"</reasoning>", "</think>", content)
+                elif cfg.api.think == "strip":
+                    content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
+                    content = re.sub(r"<reasoning>\n*", "", content)
+                    content = re.sub(r"</reasoning>", "", content)
+                elif cfg.api.think == "details":
+                    if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
+                    content = re.sub(r"<reasoning>", "<details type=\"reasoning\" open><div>", content)
+                    thoughts = ""
+                    if phase == "answer":
+                        # 判断是否有 <summary> 内容
+                        summary_match = re.search(r"(?s)<summary>.*?</summary>", before)
+                        duration_match = re.search(r'duration="(\d+)"', before)
+                        if summary_match:
+                            # 有内容 → 直接照搬
+                            thoughts = f"\n\n{summary_match.group()}"
+                        # 判断是否有 duration 内容
+                        elif duration_match:
+                            # 有内容 → 通过 duration 生成 <summary>
+                            thoughts = f'\n\n<summary>Thought for {duration_match.group(1)} seconds</summary>'
+                    content = re.sub(r"</reasoning>", f"</div>{thoughts}</details>", content)
+                else:
+                    content = re.sub(r"</reasoning>", "</reasoning>\n\n", content)
+                    log.warning("警告: THINK_TAGS_MODE 传入了未知的替换模式，将使用 <reasoning> 标签。")
 
+            phaseBak = phase
+            if repr(content) != repr(contentBak):
+                log.debug("R 内容: %s %s", phase, repr(contentBak))
+                log.debug("W 内容: %s %s", phase, repr(content))
+            else:
+                log.debug("R 内容: %s %s", phase, repr(contentBak))
+
+            if phase == "thinking" and cfg.api.think == "reasoning":
+                if type == "Anthropic": return {"type": "thinking_delta", "thinking": content}
+                return {"role": "assistant", "reasoning_content": content}
+            if phase == "tool_call":
+                return {"tool_call": content}
+            elif repr(content):
+                if type == "Anthropic": return {"type": "text_delta", "text": content}
+                else: return {"role": "assistant", "content": content}
+            else:
+                return None
+
+        @staticmethod
+        def count(text):
+            return len(enc.encode(text))
 
 @app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
 def models():
-    if request.method == "OPTIONS":
-        return utils.request.response(make_response())
-    auth_error = _require_api_auth()
-    if auth_error:
-        return auth_error
-    try:
-        def format_model_name(name: str) -> str:
-            """格式化模型名:
-            - 单段: 全大写
-            - 多段: 第一段全大写, 后续段首字母大写
-            - 数字保持不变, 符号原样保留
-            """
-
-            if not name:
-                return ""
-
-            parts = name.split('-')
-            if len(parts) == 1:
-                return parts[0].upper()
-
-            formatted = [parts[0].upper()]
-            for p in parts[1:]:
-                if not p:
-                    formatted.append("")
-                elif p.isdigit():
-                    formatted.append(p)
-                elif any(c.isalpha() for c in p):
-                    formatted.append(p.capitalize())
-                else:
-                    formatted.append(p)
-            return "-".join(formatted)
-
-        def is_english_letter(ch: str) -> bool:
-            """判断是否是英文字符 (A-Z / a-z)"""
-
-            return 'A' <= ch <= 'Z' or 'a' <= ch <= 'z'
-
-        token = utils.request.token()
-        headers = {**BROWSER_HEADERS}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        url = f"{BASE}/api/models"
-        start_time = time.perf_counter()
-        recorded = False
-        response = requests.get(url, headers=headers, timeout=8)
-        duration = time.perf_counter() - start_time
-        _record_upstream_metrics(
-            method="GET",
-            url=url,
-            status_code=response.status_code,
-            duration=duration,
-        )
-        recorded = True
-        if token_pool.contains(token):
-            if response.status_code in (401, 403):
-                token_pool.mark_failure(token)
-            else:
-                token_pool.mark_success(token)
-
-        r = response.json()
-        models = []
-        existing_ids = set()
-        upstream_created_map: Dict[str, int] = {}
-
-        for m in r.get("data", []):
-            if not m.get("info", {}).get("is_active", True):
-                continue
-
-            model_id, model_name = m.get("id"), m.get("name")
-            alias_name = MODEL_ID_ALIASES.get(model_id) if model_id else None
-            if alias_name:
-                model_name = alias_name
-            elif model_id and model_id.startswith(("GLM", "Z")):
-                model_name = model_id
-
-            if not model_name or not is_english_letter(model_name[0]):
-                model_name = format_model_name(model_id)
-
-            created_at = m.get("info", {}).get("created_at", int(datetime.now().timestamp()))
-            upstream_created_map[model_id] = created_at
-
-            entry = {
-                "id": model_id,
-                "object": "model",
-                "name": model_name,
-                "created": created_at,
-                "owned_by": "z.ai",
-            }
-            models.append(entry)
-            existing_ids.add(entry["id"])
-
-        for variant_name, config in MODEL_VARIANT_CONFIG.items():
-            upstream_id = config.get("upstream_id")
-            if upstream_id and upstream_id not in upstream_created_map:
-                continue
-            if variant_name in existing_ids:
-                continue
-
-            metadata = {
-                "upstream_id": upstream_id,
-                "features": config.get("features", {}),
-                "mcp_servers": config.get("mcp_servers", []),
-            }
-            entry = {
-                "id": variant_name,
-                "object": "model",
-                "name": variant_name,
-                "created": upstream_created_map.get(upstream_id, int(datetime.now().timestamp())),
-                "owned_by": "z.ai",
-                "description": config.get("description", ""),
-                "metadata": metadata,
-            }
-            models.append(entry)
-            existing_ids.add(variant_name)
-
-        return utils.request.response(jsonify({"object": "list", "data": models}))
-    except Exception as e:
-        if 'url' in locals() and 'start_time' in locals() and not recorded:
-            duration = time.perf_counter() - start_time
-            _record_upstream_metrics(
-                method="GET",
-                url=url,
-                status_code=None,
-                duration=duration,
-                error=str(e),
-            )
-        debug("模型列表失败: %s", e)
-        return utils.request.response(jsonify({"error": "fetch models failed"})), 500
-
-@app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
-def OpenAI_Compatible():
-        if request.method == "OPTIONS": return utils.request.response(make_response())
-        auth_error = _require_api_auth()
-        if auth_error:
-                return auth_error
-        odata = request.get_json(force=True, silent=True) or {}
-
-        id = utils.request.id("chat")
-        requested_model = (odata.get("model") or MODEL or "").strip() or MODEL
-        normalized_model = requested_model
-        for variant in MODEL_VARIANT_CONFIG:
-                if variant.lower() == requested_model.lower():
-                        normalized_model = variant
-                        break
-
-        variant_config = MODEL_VARIANT_CONFIG.get(normalized_model)
-        upstream_model = variant_config.get("upstream_id") if variant_config else normalized_model
-        model = normalized_model if variant_config else requested_model
-        messages = odata.get("messages", [])
-        raw_features = odata.get("features")
-        features: Dict[str, Any] = {
-                "image_generation": False,
-                "web_search": False,
-                "auto_web_search": False,
-                "preview_mode": False,
-                "flags": [],
-                "features": [],
-                "enable_thinking": True,
-        }
-        if isinstance(raw_features, dict):
-                for key, value in raw_features.items():
-                        features[key] = value
-        if variant_config:
-                for key, value in variant_config.get("features", {}).items():
-                        features[key] = value
-
-        reasoning_flag = odata.get("reasoning")
-        if isinstance(reasoning_flag, bool):
-                features["enable_thinking"] = reasoning_flag
-
-        for bool_key in ("enable_thinking", "web_search", "auto_web_search", "image_generation", "preview_mode"):
-                if bool_key in features:
-                        features[bool_key] = bool(features[bool_key])
-
-        for list_key in ("flags", "features"):
-                if list_key in features and not isinstance(features[list_key], list):
-                        features[list_key] = []
-
-        stream = odata.get("stream", False)
-        include_usage = stream and odata.get("stream_options", {}).get("include_usage", False)
-
-        mcp_servers: List[str] = []
-        if isinstance(odata.get("mcp_servers"), list):
-                for server in odata.get("mcp_servers"):
-                        if isinstance(server, str) and server not in mcp_servers:
-                                mcp_servers.append(server)
-        if variant_config:
-                for server in variant_config.get("mcp_servers", []):
-                        if server not in mcp_servers:
-                                mcp_servers.append(server)
-        for message in messages:
-                if isinstance(message.get("content"), list):
-                        for content_item in message["content"]:
-                                if content_item.get("type") == "image_url":
-                                        url = content_item.get("image_url", {}).get("url", "")
-                                        if url.startswith("data:"):
-                                                file_url = utils.request.image(url, id) # 上传图片
-                                                if file_url:
-                                                        content_item["image_url"]["url"] = file_url # 上传后的图片链接
-
-        data = {
-                **odata,
-                "stream": True,
-                "chat_id": id,
-                "id": utils.request.id(),
-                "model": upstream_model,
-                "messages": messages,
-                "features": features
-        }
-
-        if mcp_servers:
-                data["mcp_servers"] = mcp_servers
-
-        data.setdefault("model_item", {"id": upstream_model, "name": model, "owned_by": "z.ai"})
-
-        try:
-                response = utils.request.chat(data, id)
-        except Exception as e:
-                return utils.request.response(make_response(f"上游请求失败: {e}", 502))
-
-        prompt_tokens = utils.response.count("".join(
-                c if isinstance(c, str) else (c.get("text", "") if isinstance(c, dict) and c.get("type") == "text" else "")
-                for m in messages
-                for c in ([m["content"]] if isinstance(m.get("content"), str) else (m.get("content") or []))
-        ))
-        if stream:
-                def stream():
-                        completion_str = ""
-                        completion_tokens = 0
-                        error_message: Optional[str] = None
-
-                        if response.status_code and response.status_code >= 400:
-                                try:
-                                        error_body = response.text
-                                except Exception:
-                                        error_body = ""
-                                error_body = (error_body or "").strip()
-                                if len(error_body) > 500:
-                                        error_body = f"{error_body[:497]}..."
-                                if error_body:
-                                        error_message = f"上游返回错误 {response.status_code}: {error_body}"
-                                else:
-                                        error_message = f"上游返回错误 {response.status_code}"
-                                debug(error_message)
-                        else:
-                                try:
-                                        for data in utils.response.parse(response):
-                                                is_done = data.get("data", {}).get("done", False)
-                                                delta = utils.response.format(data)
-                                                finish_reason = "stop" if is_done else None
-
-                                                if delta:
-                                                        yield f"data: {json.dumps({
-                                                                "id": utils.request.id('chatcmpl'),
-                                                                "object": "chat.completion.chunk",
-                                                                "created": int(datetime.now().timestamp()),
-                                                                "model": model,
-                                                                "choices": [
-                                                                        {
-                                                                                "index": 0,
-                                                                                "delta": delta,
-                                                                                "message": delta,
-                                                                                "finish_reason": finish_reason
-                                                                        }
-                                                                ]
-                                                        })}\n\n"
-
-                                                        if "content" in delta:
-                                                                completion_str += delta["content"]
-                                                        if "reasoning_content" in delta:
-                                                                completion_str += delta["reasoning_content"]
-                                                        completion_tokens = utils.response.count(completion_str)
-
-                                                if is_done:
-                                                        yield f"data: {json.dumps({
-                                                                'id': utils.request.id('chatcmpl'),
-                                                                'object': 'chat.completion.chunk',
-                                                                'created': int(datetime.now().timestamp()),
-                                                                'model': model,
-                                                                'choices': [
-                                                                        {
-                                                                                'index': 0,
-                                                                                'delta': {"role": "assistant"},
-                                                                                'message': {"role": "assistant"},
-                                                                                'finish_reason': "stop"
-                                                                        }
-                                                                ]
-                                                        })}\n\n"
-                                                        break
-                                except GeneratorExit:
-                                        _finalize_upstream_response(response, error="client disconnected")
-                                        raise
-                                except requests.exceptions.ChunkedEncodingError as exc:
-                                        error_message = f"上游响应中断: {exc}"
-                                        debug(error_message)
-                                except requests.exceptions.RequestException as exc:
-                                        error_message = f"上游响应异常: {exc}"
-                                        debug(error_message)
-                                except Exception as exc:
-                                        error_message = f"解析上游响应失败: {exc}"
-                                        debug(error_message)
-
-                        if error_message:
-                                yield f"data: {json.dumps({
-                                        "id": utils.request.id('chatcmpl'),
-                                        "object": "chat.completion.chunk",
-                                        "created": int(datetime.now().timestamp()),
-                                        "model": model,
-                                        "choices": [
-                                                {
-                                                        "index": 0,
-                                                        "delta": {},
-                                                        "message": {},
-                                                        "finish_reason": "error"
-                                                }
-                                        ],
-                                        "error": {"message": error_message}
-                                })}\n\n"
-                        elif include_usage:
-                                yield f"data: {json.dumps({
-                                        "id": utils.request.id('chatcmpl'),
-                                        "object": "chat.completion.chunk",
-                                        "created": int(datetime.now().timestamp()),
-                                        "model": model,
-                                        "choices": [],
-                                        "usage": {
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens,
-                                                "total_tokens": prompt_tokens + completion_tokens
-                                        }
-                                })}\n\n"
-
-                        yield "data: [DONE]\n\n"
-                        _finalize_upstream_response(response, error=error_message)
-
-                return Response(stream(), mimetype="text/event-stream")
-        else:
-                # 上游不支持非流式，所以先用流式获取所有内容
-                contents = {
-                        "content": [],
-                        "reasoning_content": []
-                }
-                error_message: Optional[str] = None
-                if response.status_code and response.status_code >= 400:
-                        try:
-                                error_body = response.text
-                        except Exception:
-                                error_body = ""
-                        error_body = (error_body or "").strip()
-                        if len(error_body) > 500:
-                                error_body = f"{error_body[:497]}..."
-                        if error_body:
-                                error_message = f"上游返回错误 {response.status_code}: {error_body}"
-                        else:
-                                error_message = f"上游返回错误 {response.status_code}"
-                        debug(error_message)
-                if not error_message:
-                        try:
-                                for odata in utils.response.parse(response):
-                                        if odata.get("data", {}).get("done"):
-                                                break
-                                        delta = utils.response.format(odata)
-                                        if delta:
-                                                if "content" in delta:
-                                                        contents["content"].append(delta["content"])
-                                                if "reasoning_content" in delta:
-                                                        contents["reasoning_content"].append(delta["reasoning_content"])
-                        except requests.exceptions.ChunkedEncodingError as exc:
-                                error_message = f"上游响应中断: {exc}"
-                                debug(error_message)
-                        except requests.exceptions.RequestException as exc:
-                                error_message = f"上游响应异常: {exc}"
-                                debug(error_message)
-                        except Exception as exc:
-                                error_message = f"解析上游响应失败: {exc}"
-                                debug(error_message)
-
-                if error_message:
-                        _finalize_upstream_response(response, error=error_message)
-                        payload = {
-                                "error": {
-                                        "message": error_message,
-                                }
-                        }
-                        return utils.request.response(make_response(jsonify(payload), 502))
-
-                # 构建最终消息内容
-                final_message = {"role": "assistant"}
-                completion_str = ""
-                if contents["reasoning_content"]:
-                        final_message["reasoning_content"] = "".join(contents["reasoning_content"])
-                        completion_str += "".join(contents["reasoning_content"])
-                if contents["content"]:
-                        final_message["content"] = "".join(contents["content"])
-                        completion_str += "".join(contents["content"])
-                completion_tokens = utils.response.count(completion_str) # 计算 tokens
-
-                # 返回 Flask 响应
-                _finalize_upstream_response(response, error=None)
-        return utils.request.response(jsonify({
-                        "id": utils.request.id("chatcmpl"),
-                        "object": "chat.completion",
-                        "created": int(datetime.now().timestamp()),
-                        "model": model,
-                        "choices": [{
-                                "index": 0,
-                                "delta": final_message,
-                                "message": final_message,
-                                "finish_reason": "stop"
-                        }],
-                        "usage": {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens
-                        }
-                }))
-
-
-@app.route("/token-pool/status", methods=["GET", "OPTIONS"])
-def token_pool_status():
         if request.method == "OPTIONS":
                 return utils.request.response(make_response())
         auth_error = _require_api_auth()
         if auth_error:
                 return auth_error
-        snapshot = token_pool.snapshot()
-        metrics_snapshot = request_metrics.snapshot()
-        payload = {
-                "token_pool": snapshot,
-                "token_stats": metrics_snapshot.get("token_stats", []),
-        }
-        return utils.request.response(jsonify(payload))
+        try:
+                data = utils.request.models()
+                models_list = list(data.get("data", []))
 
+                existing_ids = {item.get("id") for item in models_list}
+                upstream_created_map = {}
+                for item in models_list:
+                        upstream = item.get("orignal", {}) if isinstance(item.get("orignal"), dict) else {}
+                        upstream_id = upstream.get("id")
+                        if upstream_id:
+                                upstream_created_map[upstream_id] = item.get("created", int(datetime.now().timestamp()))
 
-@app.route("/dashboard", methods=["GET", "POST"])
-def dashboard():
-        error = None
-        if AUTH_TOKEN:
-                auto_token = _extract_auth_token()
-                if auto_token and auto_token == AUTH_TOKEN and not _has_dashboard_session():
-                        _establish_dashboard_session()
-                        return redirect(url_for("dashboard"))
-        if request.method == "POST":
-                if not AUTH_TOKEN:
-                        _establish_dashboard_session()
-                        return redirect(url_for("dashboard"))
-                password = (request.form.get("password") or "").strip()
-                if password == AUTH_TOKEN:
-                        _establish_dashboard_session()
-                        return redirect(url_for("dashboard"))
-                error = "密码错误，请重试。"
-        if not _has_dashboard_session():
-                return render_template_string(
-                        DASHBOARD_LOGIN_TEMPLATE,
-                        error=error,
-                        auth_required=bool(AUTH_TOKEN),
-                )
-        payload = _build_dashboard_payload()
-        initial_data = json.dumps(payload, ensure_ascii=False)
-        return render_template_string(
-                DASHBOARD_TEMPLATE,
-                anonymous_mode=ANONYMOUS_MODE,
-                initial_data=initial_data,
-        )
+                for variant_name, config in MODEL_VARIANT_CONFIG.items():
+                        upstream_id = config.get("upstream_id")
+                        if upstream_id and upstream_id not in upstream_created_map:
+                                continue
+                        if variant_name in existing_ids:
+                                continue
 
+                        metadata = {
+                                "upstream_id": upstream_id,
+                                "features": config.get("features", {}),
+                                "mcp_servers": config.get("mcp_servers", []),
+                        }
+                        entry = {
+                                "id": variant_name,
+                                "object": "model",
+                                "name": variant_name,
+                                "created": upstream_created_map.get(upstream_id, int(datetime.now().timestamp())),
+                                "owned_by": "z.ai",
+                                "description": config.get("description", ""),
+                                "metadata": metadata,
+                        }
+                        models_list.append(entry)
+                        existing_ids.add(variant_name)
 
-@app.route("/dashboard/logout", methods=["POST"])
-def dashboard_logout():
-        _clear_dashboard_session()
-        response = jsonify({"ok": True})
-        flask_response = make_response(response)
-        flask_response.delete_cookie(app.config.get("SESSION_COOKIE_NAME", app.session_cookie_name))
-        return utils.request.response(flask_response)
-
-
-@app.route("/dashboard/api/overview", methods=["GET"])
-def dashboard_overview():
-        auth_error = _require_dashboard_auth()
-        if auth_error:
-                return auth_error
-        payload = _build_dashboard_payload()
-        return utils.request.response(jsonify(payload))
-
-
-@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE"])
-def dashboard_tokens():
-        auth_error = _require_dashboard_auth()
-        if auth_error:
-                return auth_error
-        if request.method == "GET":
-                snapshot = token_pool.snapshot()
-                metrics_snapshot = request_metrics.snapshot()
+                return utils.request.response(jsonify({"object": "list", "data": models_list}))
+        except Exception as e:
+                log.error(traceback.format_exc())
                 return utils.request.response(jsonify({
-                        "token_pool": snapshot,
-                        "token_stats": metrics_snapshot.get("token_stats", []),
-                }))
+                        "error": 500,
+                        "message": "错误: " + str(e)
+        })), 500
 
-        expects_json = request.is_json or "application/json" in (request.headers.get("Accept", "").lower())
-        data: Dict[str, Any] = {}
-        if request.is_json:
-                data = request.get_json(silent=True) or {}
-        else:
-                data = {key: request.form.getlist(key) for key in request.form.keys()}
+@app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
+def OpenAI_Compatible():
+        response = None
+        try:
+                if request.method == "OPTIONS":
+                        return utils.request.response(make_response())
 
-        token_inputs: List[str] = []
-        for value in (data.get("tokens"), data.get("token")):
-                token_inputs.extend(_normalize_token_inputs(value))
-        token_id_inputs: List[str] = []
-        for value in (data.get("token_ids"), data.get("token_id")):
-                token_id_inputs.extend(_normalize_token_inputs(value))
+                auth_error = _require_api_auth()
+                if auth_error:
+                        return auth_error
 
-        resolved_tokens: List[str] = []
-        for identifier in token_id_inputs:
-                resolved = token_pool.resolve_id(identifier)
-                if resolved and resolved not in resolved_tokens:
-                        resolved_tokens.append(resolved)
+                odata = request.get_json(force=True, silent=True) or {}
+                # log.debug("收到请求:")
+                # log.debug("  data: %s", json.dumps(odata))
+                id = utils.request.id("chat")
+                stream = odata.get("stream", False)
+                include_usage = odata.get("stream_options", {}).get("include_usage", True)
 
-        if request.method == "POST":
-                effective_tokens = list(dict.fromkeys(token_inputs))
-        else:
-                effective_tokens = list(dict.fromkeys(token_inputs + resolved_tokens))
+                data = {
+                        **utils.request.format(odata, "OpenAI"),
+                        "chat_id": id,
+                        "id": utils.request.id(),
+                }
+                requested_model = (odata.get("model") or cfg.model.default or "").strip() or cfg.model.default
+                variant_config = MODEL_VARIANT_CONFIG.get(requested_model)
+                if variant_config:
+                        upstream_model = variant_config.get("upstream_id") or requested_model
+                        data["model"] = upstream_model
+                        features = data.setdefault("features", {})
+                        for key, value in variant_config.get("features", {}).items():
+                                features[key] = value
+                        existing_servers: List[str] = []
+                        if isinstance(odata.get("mcp_servers"), list):
+                                existing_servers = [str(server) for server in odata.get("mcp_servers") if isinstance(server, str)]
+                        for server in variant_config.get("mcp_servers", []):
+                                if server not in existing_servers:
+                                        existing_servers.append(server)
+                        if existing_servers:
+                                data["mcp_servers"] = existing_servers
+                        response_model = requested_model
+                else:
+                        response_model = data.get("model", requested_model)
 
-        if not effective_tokens:
-                if expects_json:
-                        return utils.request.response(make_response(jsonify({"error": "token required"}), 400))
-                return utils.request.response(redirect(url_for("dashboard")))
+                model = response_model
+                messages = data.get("messages", [])
 
-        current_tokens = token_pool.tokens()
-        if request.method == "POST":
-                updated = False
-                for candidate in effective_tokens:
-                        if candidate not in current_tokens:
-                                current_tokens.append(candidate)
-                                updated = True
-                if updated:
-                        _update_token_pool(current_tokens)
-                payload = _build_dashboard_payload()
-                payload["ok"] = True
-                if expects_json:
-                        return utils.request.response(jsonify(payload))
-                return utils.request.response(redirect(url_for("dashboard")))
+                # 仅当需要 usage 时才计算 prompt_tokens
+                prompt_tokens: int = 0
+                if include_usage:
+                    prompt_tokens = utils.response.count("".join(
+                        c if isinstance(c, str) else (c.get("text", "") if isinstance(c, dict) and c.get("type") == "text" else "")
+                        for m in messages
+                        for c in ([m["content"]] if isinstance(m.get("content"), str) else (m.get("content") or []))
+                    ))
+        
+                response = utils.request.chat(data, id)
+                if response.status_code != 200:
+                        _finalize_upstream_response(response, error=response.text or f"HTTP {response.status_code}")
+                        return utils.request.response(jsonify({
+                                "error": response.status_code,
+                                "message": response.text or None
+                        })), response.status_code
 
-        removed = False
-        for candidate in effective_tokens:
-                if candidate in current_tokens:
-                        current_tokens.remove(candidate)
-                        removed = True
-        if removed:
-                _update_token_pool(current_tokens)
-        payload = _build_dashboard_payload()
-        payload["ok"] = True
-        if expects_json:
-                return utils.request.response(jsonify(payload))
-        return utils.request.response(redirect(url_for("dashboard")))
+                if stream:
+                        def generate_stream():
+                                completion_parts = []  # 收集 content 和 reasoning_content
+                                error_message: Optional[str] = None
+                                try:
+                                        for raw_chunk in utils.response.parse(response):
+                                                delta = utils.response.format(raw_chunk, "OpenAI")
+                                                if not delta:
+                                                        continue
+
+                                                # 累积内容（用于后续 token 计算，仅当 include_usage=True）
+                                                if include_usage:
+                                                        if "content" in delta:
+                                                                completion_parts.append(delta["content"])
+                                                        if "reasoning_content" in delta:
+                                                                completion_parts.append(delta["reasoning_content"])
+
+                                                # 构造 SSE 响应
+                                                yield f"data: {json.dumps({
+                                                        "id": utils.request.id('chatcmpl'),
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(datetime.now().timestamp() * 1000),
+                                                        "model": model,
+                                                        "choices": [{
+                                                                "index": 0,
+                                                                "delta": delta,
+                                                                "message": delta,
+                                                                "finish_reason": None
+                                                        }]
+                                                })}\n\n"
+
+                                        yield f"data: {json.dumps({
+                                                'id': utils.request.id('chatcmpl'),
+                                                'object': 'chat.completion.chunk',
+                                                'created': int(datetime.now().timestamp() * 1000),
+                                                'model': model,
+                                                'choices': [{
+                                                        'index': 0,
+                                                        'delta': {"role": "assistant"},
+                                                        'message': {"role": "assistant"},
+                                                        'finish_reason': "stop"
+                                                }]
+                                        })}\n\n"
+
+                                        # 发送 usage
+                                        if include_usage:
+                                                completion_str = "".join(completion_parts)
+                                                completion_tokens = utils.response.count(completion_str)
+                                                yield f"data: {json.dumps({
+                                                        'id': utils.request.id('chatcmpl'),
+                                                        'object': 'chat.completion.chunk',
+                                                        'created': int(datetime.now().timestamp() * 1000),
+                                                        'model': model,
+                                                        'choices': [],
+                                                        'usage': {
+                                                                'prompt_tokens': prompt_tokens,
+                                                                'completion_tokens': completion_tokens,
+                                                                'total_tokens': prompt_tokens + completion_tokens
+                                                        }
+                                                })}\n\n"
+
+                                        yield "data: [DONE]\n\n"
+                                except GeneratorExit:
+                                        error_message = "client disconnected"
+                                        raise
+                                except Exception as exc:
+                                        error_message = str(exc)
+                                        raise
+                                finally:
+                                        _finalize_upstream_response(response, error=error_message)
+
+                        return Response(generate_stream(), mimetype="text/event-stream")
+
+                else:
+                        # 伪 - 非流式
+                        content_parts = []
+                        reasoning_parts = []
+
+                        for raw_chunk in utils.response.parse(response):
+                                if raw_chunk.get("data", {}).get("done"):
+                                        break
+                                delta = utils.response.format(raw_chunk)
+                                if not delta:
+                                        continue
+                                if "content" in delta:
+                                        content_parts.append(delta["content"])
+                                if "reasoning_content" in delta:
+                                        reasoning_parts.append(delta["reasoning_content"])
+
+                        final_message = {"role": "assistant"}
+                        completion_str = ""
+                        if reasoning_parts:
+                                reasoning_text = "".join(reasoning_parts)
+                                final_message["reasoning_content"] = reasoning_text
+                                completion_str += reasoning_text
+                        if content_parts:
+                                content_text = "".join(content_parts)
+                                final_message["content"] = content_text
+                                completion_str += content_text
+
+                        completion_tokens = utils.response.count(completion_str)
+
+                        result = {
+                                "id": utils.request.id("chatcmpl"),
+                                "object": "chat.completion",
+                                "created": int(datetime.now().timestamp() * 1000),
+                                "model": model,
+                                "choices": [{
+                                        "index": 0,
+                                        "message": final_message,
+                                        "finish_reason": "stop"
+                                }]
+                        }
+
+                        if include_usage:
+                                result["usage"] = {
+                                        "prompt_tokens": prompt_tokens,
+                                        "completion_tokens": completion_tokens,
+                                        "total_tokens": prompt_tokens + completion_tokens
+                                }
+
+                        _finalize_upstream_response(response)
+                        return utils.request.response(jsonify(result))
+
+        except Exception as e:
+                log.error(traceback.format_exc())
+                if response is not None:
+                        _finalize_upstream_response(response, error=str(e))
+                return utils.request.response(jsonify({
+                        "error": 500,
+                        "message": "错误: " + str(e)
+                })), 500
+
+@app.route("/v1/messages", methods=["GET", "POST", "OPTIONS"])
+def Anthropic_Compatible():
+        response = None
+        try:
+                if request.method == "OPTIONS":
+                        return utils.request.response(make_response())
+
+                auth_error = _require_api_auth()
+                if auth_error:
+                        return auth_error
+
+                odata = request.get_json(force=True, silent=True) or {}
+                log.debug("收到请求:")
+                log.debug("  data: %s", json.dumps(odata))
+                id = utils.request.id("chat")
+                stream = odata.get("stream", False)
+
+                data = {
+                        **utils.request.format(odata, "Anthropic"),
+                        "chat_id": id,
+                        "id": utils.request.id(),
+                }
+                requested_model = (odata.get("model") or cfg.model.default or "").strip() or cfg.model.default
+                variant_config = MODEL_VARIANT_CONFIG.get(requested_model)
+                if variant_config:
+                        upstream_model = variant_config.get("upstream_id") or requested_model
+                        data["model"] = upstream_model
+                        features = data.setdefault("features", {})
+                        for key, value in variant_config.get("features", {}).items():
+                                features[key] = value
+                        existing_servers: List[str] = []
+                        if isinstance(odata.get("mcp_servers"), list):
+                                existing_servers = [str(server) for server in odata.get("mcp_servers") if isinstance(server, str)]
+                        for server in variant_config.get("mcp_servers", []):
+                                if server not in existing_servers:
+                                        existing_servers.append(server)
+                        if existing_servers:
+                                data["mcp_servers"] = existing_servers
+                        model = requested_model
+                else:
+                        model = data.get("model", requested_model)
+                messages = data.get("messages", [])
+        
+                # Anthropic 流式协议要求 message_start 中包含 input_tokens，所以必须计算
+                prompt_tokens = utils.response.count("".join(
+                    c if isinstance(c, str) else (c.get("text", "") if isinstance(c, dict) and c.get("type") == "text" else "")
+                    for m in messages
+                    for c in ([m["content"]] if isinstance(m.get("content"), str) else (m.get("content") or []))
+                ))
+        
+                response = utils.request.chat(data, id)
+                if response.status_code != 200:
+                        _finalize_upstream_response(response, error=response.text or f"HTTP {response.status_code}")
+                        return utils.request.response(jsonify({
+                                "error": response.status_code,
+                                "message": response.text or None
+                        })), response.status_code
+
+                if stream:
+                        def generate_stream():
+                                error_message: Optional[str] = None
+
+                                def _inner():
+                                        text_parts = []
+                                        tool_call_parts = []
+                                        has_tool_call = False
+
+                                        # message_start
+                                        yield "event: message_start\n"
+                                        yield f"data: {json.dumps({
+                                                'type': 'message_start',
+                                                'message': {
+                                                        'id': utils.request.id(),
+                                                        'type': 'message',
+                                                        'role': 'assistant',
+                                                        'model': model,
+                                                        'stop_reason': None,
+                                                        'stop_sequence': None,
+                                                        'usage': {
+                                                                'input_tokens': prompt_tokens,
+                                                                'output_tokens': 0
+                                                        }
+                                                }
+                                        })}\n\n"
+
+                                        yield "event: content_block_start\n"
+                                        yield f"data: {json.dumps({
+                                                'type': 'content_block_start',
+                                                'index': 0,
+                                                'content_block': {'type': 'text', 'text': ''}
+                                        })}\n\n"
+
+                                        yield "event: ping\n"
+                                        yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+
+                                        # 流式解析
+                                        for raw_chunk in utils.response.parse(response):
+                                                if raw_chunk.get("data", {}).get("done"):
+                                                        break
+                                                delta = utils.response.format(raw_chunk, "Anthropic")
+                                                if not delta:
+                                                        continue
+
+                                                if "tool_call" in delta:
+                                                        tool_call_parts.append(delta["tool_call"])
+                                                        tool_call_str = "".join(tool_call_parts)
+                                                        try:
+                                                                tool_json = json.loads(tool_call_str)
+                                                                if "arguments" in tool_json:
+                                                                        try:
+                                                                                tool_json["input"] = json.loads(tool_json["arguments"])
+                                                                        except (json.JSONDecodeError, TypeError):
+                                                                                log.warning("arguments 无法解析为 JSON，保留原值: %s", tool_json["arguments"])
+                                                                        del tool_json["arguments"]
+
+                                                                log.debug("完整！调用！: %s", tool_json)
+                                                                has_tool_call = True
+
+                                                                yield "event: content_block_stop\n"
+                                                                yield f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+                                                                yield "event: content_block_start\n"
+                                                                yield f"data: {json.dumps({
+                                                                        'type': 'content_block_start',
+                                                                        'index': 1,
+                                                                        'content_block': {
+                                                                                'type': 'tool_use',
+                                                                                **tool_json,
+                                                                                "input": None
+                                                                        }
+                                                                })}\n\n"
+
+                                                                if tool_json.get("input"):
+                                                                        input_json_str = json.dumps(tool_json["input"])
+                                                                        chunk_size = 5
+                                                                        for i in range(0, len(input_json_str), chunk_size):
+                                                                                chunk = input_json_str[i:i + chunk_size]
+                                                                                yield "event: content_block_delta\n"
+                                                                                yield f"data: {json.dumps({
+                                                                                        'type': 'content_block_delta',
+                                                                                        'index': 1,
+                                                                                        'delta': {
+                                                                                                'type': 'input_json_delta',
+                                                                                                'partial_json': chunk
+                                                                                        }
+                                                                                })}\n\n"
+
+                                                                yield "event: content_block_stop\n"
+                                                                yield f"data: {json.dumps({'type': 'content_block_stop', 'index': 1})}\n\n"
+                                                                break
+
+                                                        except json.JSONDecodeError:
+                                                                continue
+                                                        except Exception as exc:
+                                                                raise Exception(f"tool call parse fail: {exc}")
+
+                                                if "text" in delta:
+                                                        text_parts.append(delta["text"])
+                                                        yield "event: content_block_delta\n"
+                                                        yield f"data: {json.dumps({
+                                                                'type': 'content_block_delta',
+                                                                'index': 0,
+                                                                'delta': {'type': 'text_delta', 'text': delta['text']}
+                                                        })}\n\n"
+
+                                        completion_str = "".join(text_parts)
+                                        completion_tokens = utils.response.count(completion_str)
+
+                                        if not has_tool_call:
+                                                yield "event: content_block_stop\n"
+                                                yield f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+                                                yield "event: message_delta\n"
+                                                yield f"data: {json.dumps({
+                                                        'type': 'message_delta',
+                                                        'delta': {
+                                                                'stop_reason': 'end_turn',
+                                                                'stop_sequence': None
+                                                        },
+                                                        'usage': {
+                                                                'output_tokens': completion_tokens
+                                                        }
+                                                })}\n\n"
+                                        else:
+                                                yield "event: message_delta\n"
+                                                yield f"data: {json.dumps({
+                                                        'type': 'message_delta',
+                                                        'delta': {
+                                                                'stop_reason': 'tool_use',
+                                                                'stop_sequence': None
+                                                        },
+                                                        'usage': {
+                                                                'output_tokens': completion_tokens
+                                                        }
+                                                })}\n\n"
+
+                                        yield "event: message_stop\n"
+                                        yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
+
+                                try:
+                                        yield from _inner()
+                                except GeneratorExit:
+                                        error_message = "client disconnected"
+                                        raise
+                                except Exception as exc:
+                                        error_message = str(exc)
+                                        raise
+                                finally:
+                                        _finalize_upstream_response(response, error=error_message)
+
+                        return Response(generate_stream(), mimetype="text/event-stream")
+
+                else:
+                        # 伪 - 非流式
+                        text_parts = []
+                        tool_call_parts = []
+
+                        for raw_chunk in utils.response.parse(response):
+                                if raw_chunk.get("data", {}).get("done"):
+                                        break
+                                delta = utils.response.format(raw_chunk)
+                                if not delta:
+                                        continue
+
+                                if "tool_call" in delta:
+                                        tool_call_parts.append(delta["tool_call"])
+                                        tool_call_str = "".join(tool_call_parts)
+                                        try:
+                                                tool_json = json.loads(tool_call_str)
+                                                if "arguments" in tool_json:
+                                                        try:
+                                                                tool_json["input"] = json.loads(tool_json["arguments"])
+                                                                del tool_json["arguments"]
+                                                        except (json.JSONDecodeError, TypeError):
+                                                                log.warning("arguments 无法解析为 JSON，保留原值: %s", tool_json["arguments"])
+
+                                                log.debug("完整！调用！: %s", tool_json)
+                                                completion_str = "".join(text_parts)
+                                                completion_tokens = utils.response.count(completion_str)
+
+                                                content_blocks: List[Dict[str, Any]] = []
+                                                if completion_str:
+                                                        content_blocks.append({"type": "text", "text": completion_str})
+                                                content_blocks.append({"type": "tool_use", **tool_json})
+
+                                                result = {
+                                                        "id": utils.request.id(),
+                                                        "type": "message",
+                                                        "role": "assistant",
+                                                        "model": model,
+                                                        "content": content_blocks,
+                                                        "usage": {
+                                                                "input_tokens": prompt_tokens,
+                                                                "output_tokens": completion_tokens
+                                                        },
+                                                        "stop_sequence": None,
+                                                        "stop_reason": "tool_use",
+                                                }
+
+                                                _finalize_upstream_response(response)
+                                                return utils.request.response(jsonify(result))
+
+                                        except json.JSONDecodeError:
+                                                continue
+                                        except Exception as exc:
+                                                raise Exception(f"tool call parse fail: {exc}")
+
+                                if "content" in delta:
+                                        text_parts.append(delta["content"])
+                                if "reasoning_content" in delta:
+                                        text_parts.append(delta["reasoning_content"])
+
+                        # 无 tool_call，纯文本
+                        completion_str = "".join(text_parts)
+                        completion_tokens = utils.response.count(completion_str)
+
+                        result = {
+                                "id": utils.request.id(),
+                                "type": "message",
+                                "role": "assistant",
+                                "model": model,
+                                "content": [{"type": "text", "text": completion_str}] if completion_str else [],
+                                "usage": {
+                                        "input_tokens": prompt_tokens,
+                                        "output_tokens": completion_tokens
+                                },
+                                "stop_sequence": None,
+                                "stop_reason": "end_turn",
+                        }
+
+                        _finalize_upstream_response(response)
+                        return utils.request.response(jsonify(result))
+
+        except Exception as e:
+                log.error(traceback.format_exc())
+                if response is not None:
+                        _finalize_upstream_response(response, error=str(e))
+                return utils.request.response(jsonify({
+                        "error": 500,
+                        "message": "错误: " + str(e)
+                })), 500
+
+# 健康检查
+@app.route("/health")
+def health():
+    return utils.request.response(jsonify({
+        "status": "ok",
+        "timestamp": int(datetime.now().timestamp() * 1000)
+    }))
 
 # 主入口
 if __name__ == "__main__":
-        log.info("---------------------------------------------------------------------")
-        log.info("Z.ai 2 API")
-        log.info("将 Z.ai 代理为 OpenAI Compatible 格式")
-        log.info("基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 重构")
-        log.info("---------------------------------------------------------------------")
-        log.info("服务端口：%s", PORT)
-        log.info("备选模型：%s", MODEL)
-        log.info("思考处理：%s", THINK_TAGS_MODE)
-        log.info("访客模式：%s", ANONYMOUS_MODE)
-        log.info("显示调试：%s", DEBUG_MODE)
-        app.run(host="0.0.0.0", port=PORT, threaded=True, debug=DEBUG_MODE)
+    log.info("---------------------------------------------------------------------")
+    log.info("Z.ai 2 API https://github.com/hmjz100/Z.ai2api")
+    log.info("将 Z.ai 代理为 OpenAI/Anthropic Compatible 格式")
+    log.info("基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 重构")
+    log.info("---------------------------------------------------------------------")
+    log.info("请稍后，正在检查网络……")
+    models = utils.request.models()
+    log.info("---------------------------------------------------------------------")
+    log.info(f"Base           {cfg.source.protocol}//{cfg.source.host}")
+    log.info("Models         /v1/models")
+    log.info("OpenAI         /v1/chat/completions")
+    log.info("Anthropic      /v1/messages")
+    log.info("---------------------------------------------------------------------")
+    log.info("服务端口：%s", cfg.api.port)
+    log.info("可用模型：%s", ", ".join([item["id"] for item in models.get("data", []) if "id" in item]))
+    log.info("备选模型：%s", cfg.model.default)
+    log.info("思考处理：%s", cfg.api.think)
+    log.info("访客模式：%s", cfg.api.anon)
+    log.info("调试模式：%s", cfg.api.debug)
+    log.info("调试信息：%s", cfg.api.debug_msg)
+    
+    if cfg.api.debug:
+        app.run(host="0.0.0.0", port=cfg.api.port, threaded=True, debug=True)
+    else:
+        from gevent import pywsgi
+        pywsgi.WSGIServer(('0.0.0.0', cfg.api.port), app).serve_forever()
