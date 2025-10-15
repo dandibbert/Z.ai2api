@@ -598,13 +598,24 @@ DASHBOARD_TEMPLATE = """
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
     <title>Z.ai 2 API 仪表盘</title>
     <style>
-        :root { color-scheme: dark; }
+        :root {
+            color-scheme: dark;
+            --background: #020617;
+            --card: rgba(15, 23, 42, 0.75);
+            --border: rgba(148, 163, 184, 0.25);
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --accent: #22d3ee;
+            --accent-muted: rgba(34, 211, 238, 0.18);
+            --success: #34d399;
+            --danger: #f87171;
+        }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             font-family: 'Inter', 'PingFang SC', system-ui, -apple-system, sans-serif;
-            background: #020617;
-            color: #e2e8f0;
+            background: var(--background);
+            color: var(--text);
         }
         header {
             display: flex;
@@ -1898,7 +1909,7 @@ class utils:
                                 raise Exception(f"fetch models info fail: {response.text}")
 
         @staticmethod
-        def response(resp):
+        def apply_cors(resp):
                         try:
                                 origin = request.headers.get("Origin", "").strip()
                         except Exception:
@@ -2228,10 +2239,9 @@ class response:
         def count(text):
             return len(enc.encode(text))
 
-if not hasattr(utils.request, "response"):
-        utils.request.response = staticmethod(utils.response)
-if not hasattr(utils.request, "format"):
-        utils.request.format = staticmethod(utils.format)
+utils.response = response
+utils.request.response = staticmethod(utils.apply_cors)
+utils.request.format = staticmethod(utils.format)
 
 
 
