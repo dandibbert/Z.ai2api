@@ -40,6 +40,28 @@ class cfg:
                 default = str(os.getenv("MODEL", "glm-4.6"))
                 mapping = {}
 
+        @classmethod
+        def headers(cls) -> Dict[str, str]:
+                """默认请求头配置。"""
+                origin = f"{cls.source.protocol}//{cls.source.host}"
+                return {
+                        "Accept": "*/*",
+                        "Accept-Language": "zh-CN,zh;q=0.9",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Origin": origin,
+                        "Pragma": "no-cache",
+                        "Referer": f"{origin}/",
+                        "Sec-Ch-Ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+                        "Sec-Ch-Ua-Mobile": "?0",
+                        "Sec-Ch-Ua-Platform": '"Windows"',
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
+                        "X-FE-Version": "prod-fe-1.0.98",
+                }
+
 
 BASE_URL = f"{cfg.source.protocol}//{cfg.source.host}"
 AUTH_TOKEN = str(os.getenv("AUTH_TOKEN", "")).strip()
