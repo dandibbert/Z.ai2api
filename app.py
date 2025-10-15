@@ -1128,6 +1128,53 @@ DASHBOARD_LOGIN_TEMPLATE = """
 """
 
 
+def _render_status_page() -> Response:
+        html = render_template_string(
+                STATUS_PAGE_TEMPLATE,
+                upstream=f"{cfg.source.protocol}//{cfg.source.host}",
+                port=cfg.api.port,
+                anonymous_mode=cfg.api.anon,
+        )
+        return utils.request.response(make_response(html))
+
+
+def _render_dashboard(payload: Dict[str, Any]) -> Response:
+        initial_data = json.dumps(payload, ensure_ascii=False)
+        html = render_template_string(
+                DASHBOARD_TEMPLATE,
+                upstream=f"{cfg.source.protocol}//{cfg.source.host}",
+                port=cfg.api.port,
+                anonymous_mode=payload.get("anonymous_mode", cfg.api.anon),
+                initial_data=initial_data,
+        )
+        return utils.request.response(make_response(html))
+
+
+def _render_dashboard_login(error: Optional[str] = None) -> Response:
+        html = render_template_string(DASHBOARD_LOGIN_TEMPLATE, error=error)
+        return utils.request.response(make_response(html))
+
+
+def _dashboard_auth_guard() -> Optional[Response]:
+        auth_error = _require_dashboard_auth()
+        if auth_error:
+                return auth_error
+        return None
+
+
+def _normalized_token_submission() -> List[str]:
+        if request.is_json:
+                payload = request.get_json(silent=True) or {}
+                values: Any = payload.get("tokens") or payload.get("token")
+        else:
+                values = request.form.getlist("tokens") or request.form.getlist("token")
+                if not values:
+                        value = request.form.get("token")
+                        if value is not None:
+                                values = [value]
+        return _normalize_token_inputs(values)
+
+
 MODEL_ID_ALIAS_SOURCE: Dict[str, str] = {
         "glm-4.5v": "GLM-4.5V",
         "0727-106B-API": "GLM-4.5-Air",
@@ -2158,6 +2205,102 @@ class response:
         @staticmethod
         def count(text):
             return len(enc.encode(text))
+
+if not hasattr(utils.request, "response"):
+        utils.request.response = staticmethod(utils.response)
+if not hasattr(utils.request, "format"):
+        utils.request.format = staticmethod(utils.format)
+
+
+
+
+
+@app.route("/")
+def status_page():
+        return _render_status_page()
+
+
+@app.route("/status")
+def status_alias():
+        return _render_status_page()
+
+
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard_view():
+        if request.method == "POST":
+                submitted = request.form.get("token", "").strip()
+                if not submitted and request.is_json:
+                        payload = request.get_json(silent=True) or {}
+                        submitted = str(payload.get("token", "")).strip()
+                if not AUTH_TOKEN:
+                        _establish_dashboard_session()
+                        return utils.request.response(redirect(url_for("dashboard_view")))
+                if submitted == AUTH_TOKEN:
+                        _establish_dashboard_session()
+                        return utils.request.response(redirect(url_for("dashboard_view")))
+                return _render_dashboard_login("访问口令错误，请重试")
+
+        if AUTH_TOKEN and not _has_dashboard_session():
+                return _render_dashboard_login()
+
+        payload = _build_dashboard_payload()
+        return _render_dashboard(payload)
+
+
+@app.route("/dashboard/logout", methods=["POST"])
+def dashboard_logout():
+        if AUTH_TOKEN:
+                _clear_dashboard_session()
+        return utils.request.response(make_response("", 204))
+
+
+@app.route("/dashboard/api/overview", methods=["GET"])
+def dashboard_api_overview():
+        auth_error = _dashboard_auth_guard()
+        if auth_error:
+                return auth_error
+        payload = _build_dashboard_payload()
+        return utils.request.response(jsonify(payload))
+
+
+@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE"])
+def dashboard_api_tokens():
+        auth_error = _dashboard_auth_guard()
+        if auth_error:
+                return auth_error
+
+        if request.method == "GET":
+                payload = _build_dashboard_payload()
+                return utils.request.response(jsonify(payload))
+
+        if request.method == "POST":
+                tokens = _normalized_token_submission()
+                if not tokens:
+                        return utils.request.response(jsonify({"error": "invalid_request", "message": "缺少有效 Token"})), 400
+                current = token_pool.tokens()
+                for token in tokens:
+                        if token not in current:
+                                current.append(token)
+                _update_token_pool(current)
+                payload = _build_dashboard_payload()
+
+                if request.is_json:
+                        return utils.request.response(jsonify(payload))
+                return utils.request.response(redirect(url_for("dashboard_view")))
+
+        payload = request.get_json(silent=True) or {}
+        token_id = str(payload.get("token_id") or payload.get("token") or "").strip()
+        token_value = token_pool.resolve_id(token_id) if token_id else None
+        if not token_value and token_id:
+                token_value = token_id if token_pool.contains(token_id) else None
+        if not token_value:
+                return utils.request.response(jsonify({"error": "invalid_request", "message": "未找到要移除的 Token"})), 400
+
+        remaining = [item for item in token_pool.tokens() if item != token_value]
+        _update_token_pool(remaining)
+        payload = _build_dashboard_payload()
+        return utils.request.response(jsonify(payload))
+
 
 @app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
 def models():
