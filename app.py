@@ -1345,6 +1345,37 @@ MODEL_VARIANT_CONFIG = _build_model_variant_config(BASE_MODEL_VARIANT_DEFINITION
 for upstream_id, alias in MODEL_ID_ALIAS_SOURCE.items():
         cfg.model.mapping[upstream_id] = alias.lower()
 
+VISION_FILE_REFERENCE_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}_.+")
+
+
+def _build_visual_model_identifiers() -> set:
+        identifiers = {"glm-4.5v"}
+        for alias, config in MODEL_VARIANT_CONFIG.items():
+                try:
+                        upstream_id = str(config.get("upstream_id", "")).lower()
+                except Exception:
+                        upstream_id = ""
+                if upstream_id == "glm-4.5v":
+                        identifiers.add(alias.lower())
+        for source_id, mapped in getattr(cfg.model, "mapping", {}).items():
+                if str(source_id).lower() == "glm-4.5v":
+                        identifiers.add(str(mapped).lower())
+        return identifiers
+
+
+VISION_MODEL_IDENTIFIERS = _build_visual_model_identifiers()
+
+
+def _is_visual_model_name(value: Optional[str]) -> bool:
+        if value is None:
+                return False
+        normalized = str(value).strip().lower()
+        if not normalized:
+                return False
+        if normalized in VISION_MODEL_IDENTIFIERS:
+                return True
+        return normalized.startswith("glm-4.5v")
+
 
 # tiktoken 预加载
 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
@@ -1519,29 +1550,81 @@ class utils:
                                 raise
 
                 @staticmethod
-                def image(data_url, chat_id):
-                        if cfg.api.anon or not isinstance(data_url, str) or not data_url.startswith("data:"):
+                def image(media_reference, chat_id):
+                        if not isinstance(media_reference, str):
                                 return None
 
-                        header, encoded = data_url.split(",", 1)
-                        mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
+                        reference = media_reference.strip()
+                        if not reference:
+                                return None
 
-                        image_data = base64.b64decode(encoded)
-                        extension = mimetypes.guess_extension(mime_type) or ""
+                        if VISION_FILE_REFERENCE_PATTERN.match(reference):
+                                return reference
+
+                        file_bytes: Optional[bytes] = None
+                        mime_type: str = "image/png"
+                        filename: Optional[str] = None
+
+                        if reference.startswith("data:"):
+                                try:
+                                        header, encoded = reference.split(",", 1)
+                                except ValueError:
+                                        return None
+                                mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/png"
+                                try:
+                                        file_bytes = base64.b64decode(encoded)
+                                except Exception as exc:
+                                        debug("图片解码失败: %s", exc)
+                                        return None
+                        elif reference.startswith("http://") or reference.startswith("https://"):
+                                try:
+                                        response = requests.get(reference, timeout=30)
+                                        if response.status_code >= 400:
+                                                debug("下载图片失败: %s %s", reference, response.status_code)
+                                                return None
+                                        file_bytes = response.content
+                                        mime_type = response.headers.get("Content-Type", "") or "image/png"
+                                        if ";" in mime_type:
+                                                mime_type = mime_type.split(";", 1)[0]
+                                        parsed = urllib.parse.urlparse(reference)
+                                        candidate = os.path.basename(parsed.path)
+                                        if candidate:
+                                                filename = candidate
+                                except Exception as exc:
+                                        debug("下载图片异常: %s", exc)
+                                        return None
+                        else:
+                                return reference
+
+                        if not file_bytes:
+                                return None
+
+                        extension = mimetypes.guess_extension(mime_type or "") or ""
                         if extension == ".jpe":
                                 extension = ".jpg"
-                        if not extension and mime_type.startswith("image/"):
+                        if not extension and filename and os.path.splitext(filename)[1]:
+                                extension = os.path.splitext(filename)[1]
+                        if not extension and (mime_type or "").startswith("image/"):
                                 extension = f".{mime_type.split('/', 1)[1]}"
-                        filename = f"{uuid.uuid4()}{extension}"
+                        if not extension:
+                                extension = ".png"
+
+                        if not filename:
+                                filename = f"{uuid.uuid4()}{extension}"
+                        elif not os.path.splitext(filename)[1]:
+                                filename = f"{filename}{extension}"
 
                         debug("上传文件：%s", filename)
                         token = utils.request.token(prefer_pool=True)
+                        if not token:
+                                debug("图片上传失败: 未获取到可用令牌")
+                                return None
+
                         headers = {
                                 **cfg.headers(),
-                                "Referer": f"{BASE_URL}/c/{chat_id}"
+                                "Referer": f"{BASE_URL}/c/{chat_id}" if chat_id else f"{BASE_URL}/",
                         }
-                        if token:
-                                headers["Authorization"] = f"Bearer {token}"
+                        headers["Authorization"] = f"Bearer {token}"
 
                         url = f"{BASE_URL}/api/v1/files/"
                         start_time = time.perf_counter()
@@ -1549,7 +1632,7 @@ class utils:
                         try:
                                 response = requests.post(
                                         url,
-                                        files={"file": (filename, image_data, mime_type)},
+                                        files={"file": (filename, file_bytes, mime_type or "application/octet-stream")},
                                         headers=headers,
                                         timeout=30,
                                 )
@@ -1935,11 +2018,13 @@ class utils:
                         return resp
 
         @staticmethod
-        def format(data: Dict, type: str = "OpenAI"):
+        def format(data: Dict, type: str = "OpenAI", chat_id: Optional[str] = None):
             odata = {**data.copy()}
             new_messages = []
-            chat_id = odata.get("chat_id")
-            model = odata.get("model", cfg.model.default)
+            chat_id = chat_id or odata.get("chat_id")
+            requested_model = odata.get("model", cfg.model.default)
+            model = requested_model
+            is_visual_request = _is_visual_model_name(requested_model)
 
             models = utils.request.models() # 请求模型信息，以获取映射设置
             # 如果找到了映射设置
@@ -1951,6 +2036,9 @@ class utils:
                         log.debug(f"模型映射: {model} -> {source_id}")
                         model = source_id
                         break
+
+            if _is_visual_model_name(model):
+                is_visual_request = True
 
             # Anthropic - system 转换 role:system
             if "system" in odata:
@@ -2017,21 +2105,32 @@ class utils:
                                     "text": f"system: image error - Unsupported format or missing URL\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
                                 })
                                 continue
-                            # 将以 data: 编码的图片链接上传到服务器
-                            try:
-                                uploaded_url = utils.request.image(media_url, chat_id)
-                                if uploaded_url: media_url = uploaded_url
-                            except Exception as e:
-                                if isinstance(new_content, str):
-                                    new_content = [{
+
+                            requires_upload = False
+                            if isinstance(media_url, str):
+                                requires_upload = media_url.startswith("data:") or (
+                                    is_visual_request and not VISION_FILE_REFERENCE_PATTERN.match(media_url)
+                                )
+
+                            if requires_upload:
+                                try:
+                                    uploaded_url = utils.request.image(media_url, chat_id)
+                                except Exception as e:
+                                    uploaded_url = None
+                                    debug("图片上传出现异常: %s", e)
+                                if uploaded_url:
+                                    media_url = uploaded_url
+                                elif media_url.startswith("data:") or is_visual_request:
+                                    if isinstance(new_content, str):
+                                        new_content = [{
+                                            "type": "text",
+                                            "text": new_content
+                                        }]
+                                    new_content.append({
                                         "type": "text",
-                                        "text": new_content
-                                    }]
-                                new_content.append({
-                                    "type": "text",
-                                    "text": f"system: image upload error - {e}\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
-                                })
-                                continue
+                                        "text": f"system: image upload error - unable to upload or resolve image\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
+                                    })
+                                    continue
 
                             if isinstance(new_content, str):
                                 new_content = [{
@@ -2404,7 +2503,7 @@ def OpenAI_Compatible():
                 include_usage = odata.get("stream_options", {}).get("include_usage", True)
 
                 data = {
-                        **utils.request.format(odata, "OpenAI"),
+                        **utils.request.format(odata, "OpenAI", chat_id=id),
                         "chat_id": id,
                         "id": utils.request.id(),
                 }
@@ -2599,7 +2698,7 @@ def Anthropic_Compatible():
                 stream = odata.get("stream", False)
 
                 data = {
-                        **utils.request.format(odata, "Anthropic"),
+                        **utils.request.format(odata, "Anthropic", chat_id=id),
                         "chat_id": id,
                         "id": utils.request.id(),
                 }
