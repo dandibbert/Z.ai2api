@@ -40,6 +40,28 @@ class cfg:
                 default = str(os.getenv("MODEL", "glm-4.6"))
                 mapping = {}
 
+        @classmethod
+        def headers(cls) -> Dict[str, str]:
+                """默认请求头配置。"""
+                origin = f"{cls.source.protocol}//{cls.source.host}"
+                return {
+                        "Accept": "*/*",
+                        "Accept-Language": "zh-CN,zh;q=0.9",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Origin": origin,
+                        "Pragma": "no-cache",
+                        "Referer": f"{origin}/",
+                        "Sec-Ch-Ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+                        "Sec-Ch-Ua-Mobile": "?0",
+                        "Sec-Ch-Ua-Platform": '"Windows"',
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
+                        "X-FE-Version": "prod-fe-1.0.98",
+                }
+
 
 BASE_URL = f"{cfg.source.protocol}//{cfg.source.host}"
 AUTH_TOKEN = str(os.getenv("AUTH_TOKEN", "")).strip()
@@ -576,13 +598,24 @@ DASHBOARD_TEMPLATE = """
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
     <title>Z.ai 2 API 仪表盘</title>
     <style>
-        :root { color-scheme: dark; }
+        :root {
+            color-scheme: dark;
+            --background: #020617;
+            --card: rgba(15, 23, 42, 0.75);
+            --border: rgba(148, 163, 184, 0.25);
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --accent: #22d3ee;
+            --accent-muted: rgba(34, 211, 238, 0.18);
+            --success: #34d399;
+            --danger: #f87171;
+        }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             font-family: 'Inter', 'PingFang SC', system-ui, -apple-system, sans-serif;
-            background: #020617;
-            color: #e2e8f0;
+            background: var(--background);
+            color: var(--text);
         }
         header {
             display: flex;
@@ -1128,6 +1161,53 @@ DASHBOARD_LOGIN_TEMPLATE = """
 """
 
 
+def _render_status_page() -> Response:
+        html = render_template_string(
+                STATUS_PAGE_TEMPLATE,
+                upstream=f"{cfg.source.protocol}//{cfg.source.host}",
+                port=cfg.api.port,
+                anonymous_mode=cfg.api.anon,
+        )
+        return utils.request.response(make_response(html))
+
+
+def _render_dashboard(payload: Dict[str, Any]) -> Response:
+        initial_data = json.dumps(payload, ensure_ascii=False)
+        html = render_template_string(
+                DASHBOARD_TEMPLATE,
+                upstream=f"{cfg.source.protocol}//{cfg.source.host}",
+                port=cfg.api.port,
+                anonymous_mode=payload.get("anonymous_mode", cfg.api.anon),
+                initial_data=initial_data,
+        )
+        return utils.request.response(make_response(html))
+
+
+def _render_dashboard_login(error: Optional[str] = None) -> Response:
+        html = render_template_string(DASHBOARD_LOGIN_TEMPLATE, error=error)
+        return utils.request.response(make_response(html))
+
+
+def _dashboard_auth_guard() -> Optional[Response]:
+        auth_error = _require_dashboard_auth()
+        if auth_error:
+                return auth_error
+        return None
+
+
+def _normalized_token_submission() -> List[str]:
+        if request.is_json:
+                payload = request.get_json(silent=True) or {}
+                values: Any = payload.get("tokens") or payload.get("token")
+        else:
+                values = request.form.getlist("tokens") or request.form.getlist("token")
+                if not values:
+                        value = request.form.get("token")
+                        if value is not None:
+                                values = [value]
+        return _normalize_token_inputs(values)
+
+
 MODEL_ID_ALIAS_SOURCE: Dict[str, str] = {
         "glm-4.5v": "GLM-4.5V",
         "0727-106B-API": "GLM-4.5-Air",
@@ -1264,6 +1344,37 @@ MODEL_VARIANT_CONFIG = _build_model_variant_config(BASE_MODEL_VARIANT_DEFINITION
 
 for upstream_id, alias in MODEL_ID_ALIAS_SOURCE.items():
         cfg.model.mapping[upstream_id] = alias.lower()
+
+VISION_FILE_REFERENCE_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}_.+")
+
+
+def _build_visual_model_identifiers() -> set:
+        identifiers = {"glm-4.5v"}
+        for alias, config in MODEL_VARIANT_CONFIG.items():
+                try:
+                        upstream_id = str(config.get("upstream_id", "")).lower()
+                except Exception:
+                        upstream_id = ""
+                if upstream_id == "glm-4.5v":
+                        identifiers.add(alias.lower())
+        for source_id, mapped in getattr(cfg.model, "mapping", {}).items():
+                if str(source_id).lower() == "glm-4.5v":
+                        identifiers.add(str(mapped).lower())
+        return identifiers
+
+
+VISION_MODEL_IDENTIFIERS = _build_visual_model_identifiers()
+
+
+def _is_visual_model_name(value: Optional[str]) -> bool:
+        if value is None:
+                return False
+        normalized = str(value).strip().lower()
+        if not normalized:
+                return False
+        if normalized in VISION_MODEL_IDENTIFIERS:
+                return True
+        return normalized.startswith("glm-4.5v")
 
 
 # tiktoken 预加载
@@ -1439,29 +1550,81 @@ class utils:
                                 raise
 
                 @staticmethod
-                def image(data_url, chat_id):
-                        if cfg.api.anon or not isinstance(data_url, str) or not data_url.startswith("data:"):
+                def image(media_reference, chat_id):
+                        if not isinstance(media_reference, str):
                                 return None
 
-                        header, encoded = data_url.split(",", 1)
-                        mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
+                        reference = media_reference.strip()
+                        if not reference:
+                                return None
 
-                        image_data = base64.b64decode(encoded)
-                        extension = mimetypes.guess_extension(mime_type) or ""
+                        if VISION_FILE_REFERENCE_PATTERN.match(reference):
+                                return reference
+
+                        file_bytes: Optional[bytes] = None
+                        mime_type: str = "image/png"
+                        filename: Optional[str] = None
+
+                        if reference.startswith("data:"):
+                                try:
+                                        header, encoded = reference.split(",", 1)
+                                except ValueError:
+                                        return None
+                                mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/png"
+                                try:
+                                        file_bytes = base64.b64decode(encoded)
+                                except Exception as exc:
+                                        debug("图片解码失败: %s", exc)
+                                        return None
+                        elif reference.startswith("http://") or reference.startswith("https://"):
+                                try:
+                                        response = requests.get(reference, timeout=30)
+                                        if response.status_code >= 400:
+                                                debug("下载图片失败: %s %s", reference, response.status_code)
+                                                return None
+                                        file_bytes = response.content
+                                        mime_type = response.headers.get("Content-Type", "") or "image/png"
+                                        if ";" in mime_type:
+                                                mime_type = mime_type.split(";", 1)[0]
+                                        parsed = urllib.parse.urlparse(reference)
+                                        candidate = os.path.basename(parsed.path)
+                                        if candidate:
+                                                filename = candidate
+                                except Exception as exc:
+                                        debug("下载图片异常: %s", exc)
+                                        return None
+                        else:
+                                return reference
+
+                        if not file_bytes:
+                                return None
+
+                        extension = mimetypes.guess_extension(mime_type or "") or ""
                         if extension == ".jpe":
                                 extension = ".jpg"
-                        if not extension and mime_type.startswith("image/"):
+                        if not extension and filename and os.path.splitext(filename)[1]:
+                                extension = os.path.splitext(filename)[1]
+                        if not extension and (mime_type or "").startswith("image/"):
                                 extension = f".{mime_type.split('/', 1)[1]}"
-                        filename = f"{uuid.uuid4()}{extension}"
+                        if not extension:
+                                extension = ".png"
+
+                        if not filename:
+                                filename = f"{uuid.uuid4()}{extension}"
+                        elif not os.path.splitext(filename)[1]:
+                                filename = f"{filename}{extension}"
 
                         debug("上传文件：%s", filename)
                         token = utils.request.token(prefer_pool=True)
+                        if not token:
+                                debug("图片上传失败: 未获取到可用令牌")
+                                return None
+
                         headers = {
                                 **cfg.headers(),
-                                "Referer": f"{BASE_URL}/c/{chat_id}"
+                                "Referer": f"{BASE_URL}/c/{chat_id}" if chat_id else f"{BASE_URL}/",
                         }
-                        if token:
-                                headers["Authorization"] = f"Bearer {token}"
+                        headers["Authorization"] = f"Bearer {token}"
 
                         url = f"{BASE_URL}/api/v1/files/"
                         start_time = time.perf_counter()
@@ -1469,7 +1632,7 @@ class utils:
                         try:
                                 response = requests.post(
                                         url,
-                                        files={"file": (filename, image_data, mime_type)},
+                                        files={"file": (filename, file_bytes, mime_type or "application/octet-stream")},
                                         headers=headers,
                                         timeout=30,
                                 )
@@ -1608,213 +1771,228 @@ class utils:
                         g.current_user_info = info
                         return info
 
+                @staticmethod
+                def signature(prarms: Dict, content: str) -> Dict:
+                        for param in ["timestamp", "requestId", "user_id"]:
+                                if param not in prarms or not prarms.get(param):
+                                        raise ValueError(f"need prarm: {param}")
+
+                        def _hmac_sha256(key: bytes, msg: bytes):
+                                return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+                        # content = content.strip()
+                        request_time = int(prarms.get("timestamp", datetime.now().timestamp() * 1000))  # 请求时间戳（毫秒）
+
+                        # 第 1 级签名
+                        signature_expire = request_time // (5 * 60 * 1000)  # 5 分钟粒度
+                        signature_1_plaintext = str(signature_expire)
+                        signature_1 = _hmac_sha256(b"junjie", signature_1_plaintext.encode('utf-8'))
+
+                        # 第 2 级签名
+                        content = base64.b64encode(content.encode('utf-8')).decode('ascii')
+
+                        signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
+                        signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
+                        signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
+
+                        # .......:.---*==**==+===-=-::.....   .::::.:.................:::.:-::-:-::.
+                        # .....:.::==:+--==--=---:-=:::..  .-=+++*+++++=-:.   ......:.::::.:-:----:.
+                        # ...:.....::--::-----::::.::::. .-+*************++-:. .::..:.:::-::----=-::.
+                        # ........:..:.:-=-----::::::...:+++************+++++-. ..:::.:::---:=====-..
+                        # .......:.::::=-=-----:::::::..=*++++**********+++++=:  .-::::::--=--++++=..      .
+                        # ......::..:::=-=-----::-*-=:.:=*+++++==+++=+====+===:..::.::--::--==++++=:.    ..
+                        # ........:-:::::---::::-:=::: -+=+++==++=++======++==-...===:.:-----=+*+==:..
+                        # . ..:++++*--=-=##+*=::-::::--=************++*+++*+==-.:.-:-:.:::---=+%%%%=..      .
+                        #   ...:-=:.::::-%#=-:...::.:=++****#*******++**#***++-:-:-+-:==:..:--*%@@@*.... .:--
+                        # ..::::::::--:::=---::::::..+*+*******+===::-+*****+=::---=--::.:::----=++=-::::.-==
+                        # ::::::::::::---:-:::-:--:---*++***+*****+==+++++++==::=-------=--------------------
+                        # :::::::::---------------: .:+++***++=++*+*+=-=++++=--==============================
+                        # :::::--------------------::--=+****: .:...:. -+*++-================================
+                        # ::::--------------------------==***+-+*+++-:-+*+=-=++=++++==++===============++====
+                        # ----------------------------===-=*#**++**+++***--..-=++++++++++++++++++++++++++++++
+                        # --------------------============--+**********+-:-.   :+++++++++++++++++++++++++++=+
+                        # ------------------=============-. .-=++++++=-::--:    .=+*++++++++++++++++++======+
+                        # --------====------===========-:...::..:-:::::::---   ...:=+++++++++++++++++++++++==
+                        # -------=================---:......-=::=+==+=-::--:........-=+**++++++++++++++++++++
+                        # --------==--========--::......... :++++*++**=:::::=-........:-=++++++++++++++++++++
+                        # -----=---====----::.............:--+********+=-:==:.............:::-=++++++++--++==
+                        # ======.:.:=---=-........ .....:=+**+**###*****++=:...................-+*++**+*+++++
+                        # ======:.-----==:....... ......-*******##********++=....................-++++++:-+++
+                        # +++++*+++*+++-................=*******************+:....................=*+*+++++++
+                        # +++++++++++*-................-+********************-................... -*+++++++++
+                        # +++++++++++*-...............:=+********************-..............::::..=++++++++++
+                        # ++++++++++++=...............:=+********************-...............:---:-++++++++++
+                        # +++++++++++*= ............   .-*******************=..:...................++++++++++
+                        # +++++++**++=:........  .....  -*++**************+=: .....................-+++++++++
+                        # +++++++=-:....................=*+=+++++=++******=:   ....--...............-++++++++
+                        # ++++++-......................:***+==---::-==+===-........::.. .............=+++++++
+                        # ++++++........................***+=-::.. .:-----:.:-..... .................:+======
+                        # +++++=........................-==-:..     ...::...:-........................-++++++
+                        # ++++++..........................          .      ............................:+++++
+                        # ++++++.........................        .....        .........................:+++++
+                        # ++++++: ........................  ...........    ............................-*++++
+                        # +++++*- ........................  ............   ............ ...............=+++++
+                        # 哎呀！哎呀！哎呀呀呀！
+                        # 哎↘呀哎↘↗呀哎呀呀呀
+                        # junjie，jun 总啊！
+                        # 您怎么就改了签名算法啊哎呀！
+                        # 哎呀哎呀哎呀呀呀呀呀
+                        # 太感谢我 jun 总了呀呀呀呀
+                        # 太性情 太感谢 太通透了
+                        # 直接就宣判了啊！
+                        # 这可是带 hmac 的签名算法
+                        # 砸到小户身上脸都是疼的~
+                        # 祝开发此签名的开发者
+                        # 学业工作都顺利
+                        # 用苹果手机
+                        # 开苹果汽车
+                        # 住苹果房子
+                        # 享苹果人生
+                        # 你必定是
+                        # 开兰博基尼
+                        # 坐私人飞机
+                        # 同时也祝您和您的家里人
+                        # 身体健康
+                        # 事业顺利
+                        # 家庭幸福
+                        # 在以后的人生里
+                        # 购买力越来越苹果爆赞👍
+
+                        log.debug("生成签名: %s", signature_2)
+                        log.debug("  请求时间: %s", prarms.get("timestamp"))
+                        log.debug("  请求标识: %s", prarms.get("requestId"))
+                        log.debug("  用户标识: %s", prarms.get("user_id"))
+                        log.debug("  最后内容: %s", content[:50])
+                        return {
+                                "signature": signature_2,
+                                "timestamp": request_time
+                        }
+
+                _models_cache = {}
+                @staticmethod
+                def models() -> Dict:
+                        """获取模型列表"""
+                        current_token: Optional[str]
+                        if cfg.api.anon:
+                                if has_request_context():
+                                        current_token = utils.request.user().get('token')
+                                else:
+                                        log.debug("跳过请求上下文外的用户令牌解析，回退到静态令牌")
+                                        current_token = cfg.source.token
+                        else:
+                                current_token = cfg.source.token
+
+                        if not current_token:
+                                cached = utils.request._models_cache
+                                if cached:
+                                        return cached
+                                log.debug("无法获取模型列表：缺少有效令牌")
+                                return {"object": "list", "data": []}
+
+                        if utils.request._models_cache:
+                                return utils.request._models_cache
+
+                        def format_model_name(name: str) -> str:
+                                """格式化模型名"""
+                                if not name:
+                                        return ""
+                                parts = name.split('-')
+                                if len(parts) == 1:
+                                        return parts[0].upper()
+                                formatted = [parts[0].upper()]
+                                for p in parts[1:]:
+                                        if not p:
+                                                formatted.append("")
+                                        elif p.isdigit():
+                                                formatted.append(p)
+                                        elif any(c.isalpha() for c in p):
+                                                formatted.append(p.capitalize())
+                                        else:
+                                                formatted.append(p)
+                                return "-".join(formatted)
+
+                        def get_model_name(source_id: str, model_name: str) -> str:
+                                """获取模型名称：优先自带，其次智能生成"""
+
+                                # 处理自带系列名的模型名称
+                                if source_id.startswith(("GLM", "Z")) and "." in source_id:
+                                        return source_id
+
+                                if model_name.startswith(("GLM", "Z")) and "." in model_name:
+                                        return model_name
+
+                                # 无法识别系列名，但名称仍为英文
+                                if not model_name or not ('A' <= model_name[0] <= 'Z' or 'a' <= model_name[0] <= 'z'):
+                                        model_name = format_model_name(source_id)
+                                        if not model_name.upper().startswith(("GLM", "Z")): model_name = model_name = "GLM-" + format_model_name(source_id)
+
+                                return model_name
+
+                        def get_model_id(source_id: str, model_name: str) -> str:
+                                """获取模型 ID：优先配置，其次智能生成"""
+                                if hasattr(cfg.model, 'mapping') and source_id in cfg.model.mapping:
+                                        return cfg.model.mapping[source_id]
+
+                                # 找不到配置则生成智能 ID
+                                smart_id = model_name.lower()
+                                cfg.model.mapping[source_id] = smart_id
+                                return smart_id
+
+                        headers = {
+                                **cfg.headers(),
+                                "Authorization": f"Bearer {current_token}",
+                                "Content-Type": "application/json"
+                        }
+                        response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers)
+                        if response.status_code == 200:
+                                data = response.json()
+                                models = []
+                                for m in data.get("data", []):
+                                        if not m.get("info", {}).get("is_active", True):
+                                                continue
+                                        model_id = m.get("id")
+                                        model_name = m.get("name")
+                                        model_info = m.get("info", {})
+                                        model_meta = model_info.get("meta", {})
+                                        model_logo = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2030%2030%22%20style%3D%22background%3A%232D2D2D%22%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M15.47%207.1l-1.3%201.85c-.2.29-.54.47-.9.47h-7.1V7.09c0%20.01%209.31.01%209.31.01z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M24.3%207.1L13.14%2022.91H5.7l11.16-15.81z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M14.53%2022.91l1.31-1.86c.2-.29.54-.47.9-.47h7.09v2.33h-9.3z%22%2F%3E%3C%2Fsvg%3E"
+
+                                        model_meta_r = {
+                                                "profile_image_url": model_logo,
+                                                "capabilities": model_meta.get("capabilities"),
+                                                "description": model_meta.get("description"),
+                                                "hidden": model_meta.get("hidden"),
+                                                "suggestion_prompts": [{"content": item["prompt"]} for item in (model_meta.get("suggestion_prompts") or []) if isinstance(item, dict) and "prompt" in item]
+                                        }
+                                        models.append({
+                                                "id": get_model_id(model_id, get_model_name(model_id, model_name)),
+                                                "object": "model",
+                                                "name": get_model_name(model_id, model_name),
+                                                "meta": model_meta_r,
+                                                "info": {
+                                                        "meta": model_meta_r
+                                                },
+                                                "created": model_info.get("created_at", int(datetime.now().timestamp())),
+                                                "owned_by": "z.ai",
+                                                "orignal": {
+                                                        "name": model_name,
+                                                        "id": model_id,
+                                                        "info": model_info
+                                                },
+                                                # Special For Open WebUI
+                                                # So, Fuck you! Private!
+                                                "access_control": None,
+                                        })
+                                result = {
+                                        "object": "list",
+                                        "data": models,
+                                }
+                                utils.request._models_cache = result
+                                return result
+                        else:
+                                raise Exception(f"fetch models info fail: {response.text}")
+
         @staticmethod
-        def signature(prarms: Dict, content: str) -> Dict:
-            for param in ["timestamp", "requestId", "user_id"]:
-                if param not in prarms or not prarms.get(param):
-                    raise ValueError(f"need prarm: {param}")
-
-            def _hmac_sha256(key: bytes, msg: bytes):
-                return hmac.new(key, msg, hashlib.sha256).hexdigest()
-
-            # content = content.strip()
-            request_time = int(prarms.get("timestamp", datetime.now().timestamp() * 1000))  # 请求时间戳（毫秒）
-
-            # 第 1 级签名
-            signature_expire = request_time // (5 * 60 * 1000)  # 5 分钟粒度
-            signature_1_plaintext = str(signature_expire)
-            signature_1 = _hmac_sha256(b"junjie", signature_1_plaintext.encode('utf-8'))
-
-            # 第 2 级签名
-            content = base64.b64encode(content.encode('utf-8')).decode('ascii')
-
-            signature_prarms = str(','.join([f"{k},{prarms[k]}" for k in sorted(prarms.keys())]))
-            signature_2_plaintext = f"{signature_prarms}|{content}|{str(request_time)}"
-            signature_2 = _hmac_sha256(signature_1.encode('utf-8'), signature_2_plaintext.encode('utf-8'))
-
-            # .......:.---*==**==+===-=-::.....   .::::.:.................:::.:-::-:-::.  
-            # .....:.::==:+--==--=---:-=:::..  .-=+++*+++++=-:.   ......:.::::.:-:----:.      
-            # ...:.....::--::-----::::.::::. .-+*************++-:. .::..:.:::-::----=-::.     
-            # ........:..:.:-=-----::::::...:+++************+++++-. ..:::.:::---:=====-..        
-            # .......:.::::=-=-----:::::::..=*++++**********+++++=:  .-::::::--=--++++=..      .
-            # ......::..:::=-=-----::-*-=:.:=*+++++==+++=+====+===:..::.::--::--==++++=:.    ..  
-            # ........:-:::::---::::-:=::: -+=+++==++=++======++==-...===:.:-----=+*+==:..       
-            # . ..:++++*--=-=##+*=::-::::--=************++*+++*+==-.:.-:-:.:::---=+%%%%=..      .
-            #   ...:-=:.::::-%#=-:...::.:=++****#*******++**#***++-:-:-+-:==:..:--*%@@@*.... .:--
-            # ..::::::::--:::=---::::::..+*+*******+===::-+*****+=::---=--::.:::----=++=-::::.-==
-            # ::::::::::::---:-:::-:--:---*++***+*****+==+++++++==::=-------=--------------------
-            # :::::::::---------------: .:+++***++=++*+*+=-=++++=--==============================
-            # :::::--------------------::--=+****: .:...:. -+*++-================================
-            # ::::--------------------------==***+-+*+++-:-+*+=-=++=++++==++===============++====
-            # ----------------------------===-=*#**++**+++***--..-=++++++++++++++++++++++++++++++
-            # --------------------============--+**********+-:-.   :+++++++++++++++++++++++++++=+
-            # ------------------=============-. .-=++++++=-::--:    .=+*++++++++++++++++++======+
-            # --------====------===========-:...::..:-:::::::---   ...:=+++++++++++++++++++++++==
-            # -------=================---:......-=::=+==+=-::--:........-=+**++++++++++++++++++++
-            # --------==--========--::......... :++++*++**=:::::=-........:-=++++++++++++++++++++
-            # -----=---====----::.............:--+********+=-:==:.............:::-=++++++++--++==
-            # ======.:.:=---=-........ .....:=+**+**###*****++=:...................-+*++**+*+++++
-            # ======:.-----==:....... ......-*******##********++=....................-++++++:-+++
-            # +++++*+++*+++-................=*******************+:....................=*+*+++++++
-            # +++++++++++*-................-+********************-................... -*+++++++++
-            # +++++++++++*-...............:=+********************-..............::::..=++++++++++
-            # ++++++++++++=...............:=+********************-...............:---:-++++++++++
-            # +++++++++++*= ............   .-*******************=..:...................++++++++++
-            # +++++++**++=:........  .....  -*++**************+=: .....................-+++++++++
-            # +++++++=-:....................=*+=+++++=++******=:   ....--...............-++++++++
-            # ++++++-......................:***+==---::-==+===-........::.. .............=+++++++
-            # ++++++........................***+=-::.. .:-----:.:-..... .................:+======
-            # +++++=........................-==-:..     ...::...:-........................-++++++
-            # ++++++..........................          .      ............................:+++++
-            # ++++++.........................        .....        .........................:+++++
-            # ++++++: ........................  ...........    ............................-*++++
-            # +++++*- ........................  ............   ............ ...............=+++++
-            # 哎呀！哎呀！哎呀呀呀！
-            # 哎↘呀哎↘↗呀哎呀呀呀
-            # junjie，jun 总啊！
-            # 您怎么就改了签名算法啊哎呀！
-            # 哎呀哎呀哎呀呀呀呀呀
-            # 太感谢我 jun 总了呀呀呀呀
-            # 太性情 太感谢 太通透了
-            # 直接就宣判了啊！
-            # 这可是带 hmac 的签名算法
-            # 砸到小户身上脸都是疼的~
-            # 祝开发此签名的开发者
-            # 学业工作都顺利
-            # 用苹果手机
-            # 开苹果汽车
-            # 住苹果房子
-            # 享苹果人生
-            # 你必定是
-            # 开兰博基尼
-            # 坐私人飞机
-            # 同时也祝您和您的家里人
-            # 身体健康
-            # 事业顺利
-            # 家庭幸福
-            # 在以后的人生里
-            # 购买力越来越苹果爆赞👍
-
-            log.debug("生成签名: %s", signature_2)
-            log.debug("  请求时间: %s", prarms.get("timestamp"))
-            log.debug("  请求标识: %s", prarms.get("requestId"))
-            log.debug("  用户标识: %s", prarms.get("user_id"))
-            log.debug("  最后内容: %s", content[:50])
-            return {
-                "signature": signature_2,
-                "timestamp": request_time
-            }
-
-        _models_cache = {}
-        @staticmethod
-        def models() -> Dict:
-            """获取模型列表"""
-            current_token = utils.request.user().get('token') if cfg.api.anon else cfg.source.token
-
-            if utils.request._models_cache:
-                return utils.request._models_cache
-
-            def format_model_name(name: str) -> str:
-                """格式化模型名"""
-                if not name:
-                    return ""
-                parts = name.split('-')
-                if len(parts) == 1:
-                    return parts[0].upper()
-                formatted = [parts[0].upper()]
-                for p in parts[1:]:
-                    if not p:
-                        formatted.append("")
-                    elif p.isdigit():
-                        formatted.append(p)
-                    elif any(c.isalpha() for c in p):
-                        formatted.append(p.capitalize())
-                    else:
-                        formatted.append(p)
-                return "-".join(formatted)
-
-            def get_model_name(source_id: str, model_name: str) -> str:
-                """获取模型名称：优先自带，其次智能生成"""
-
-                # 处理自带系列名的模型名称
-                if source_id.startswith(("GLM", "Z")) and "." in source_id:
-                    return source_id
-
-                if model_name.startswith(("GLM", "Z")) and "." in model_name:
-                    return model_name
-
-                # 无法识别系列名，但名称仍为英文
-                if not model_name or not ('A' <= model_name[0] <= 'Z' or 'a' <= model_name[0] <= 'z'):
-                    model_name = format_model_name(source_id)
-                    if not model_name.upper().startswith(("GLM", "Z")): model_name = model_name = "GLM-" + format_model_name(source_id)
-
-                return model_name
-
-            def get_model_id(source_id: str, model_name: str) -> str:
-                """获取模型 ID：优先配置，其次智能生成"""
-                if hasattr(cfg.model, 'mapping') and source_id in cfg.model.mapping:
-                    return cfg.model.mapping[source_id]
-
-                # 找不到配置则生成智能 ID
-                smart_id = model_name.lower()
-                cfg.model.mapping[source_id] = smart_id
-                return smart_id
-
-            headers = {
-                **cfg.headers(),
-                "Authorization": f"Bearer {current_token}",
-                "Content-Type": "application/json"
-            }
-            response = requests.get(f"{cfg.source.protocol}//{cfg.source.host}/api/models", headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                models = []
-                for m in data.get("data", []):
-                    if not m.get("info", {}).get("is_active", True):
-                        continue
-                    model_id = m.get("id")
-                    model_name = m.get("name")
-                    model_info = m.get("info", {})
-                    model_meta = model_info.get("meta", {})
-                    model_logo = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2030%2030%22%20style%3D%22background%3A%232D2D2D%22%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M15.47%207.1l-1.3%201.85c-.2.29-.54.47-.9.47h-7.1V7.09c0%20.01%209.31.01%209.31.01z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M24.3%207.1L13.14%2022.91H5.7l11.16-15.81z%22%2F%3E%3Cpath%20fill%3D%22%23FFFFFF%22%20d%3D%22M14.53%2022.91l1.31-1.86c.2-.29.54-.47.9-.47h7.09v2.33h-9.3z%22%2F%3E%3C%2Fsvg%3E"
-
-                    model_meta_r = {
-                        "profile_image_url": model_logo,
-                        "capabilities": model_meta.get("capabilities"),
-                        "description": model_meta.get("description"),
-                        "hidden": model_meta.get("hidden"),
-                        "suggestion_prompts": [{"content": item["prompt"]} for item in (model_meta.get("suggestion_prompts") or []) if isinstance(item, dict) and "prompt" in item]
-                    }
-                    models.append({
-                        "id": get_model_id(model_id, get_model_name(model_id, model_name)),
-                        "object": "model",
-                        "name": get_model_name(model_id, model_name),
-                        "meta": model_meta_r,
-                        "info": {
-                            "meta": model_meta_r
-                        },
-                        "created": model_info.get("created_at", int(datetime.now().timestamp())),
-                        "owned_by": "z.ai",
-                        "orignal": {
-                            "name": model_name,
-                            "id": model_id,
-                            "info": model_info
-                        },
-                        # Special For Open WebUI
-                        # So, Fuck you! Private!
-                        "access_control": None,
-                    })
-                result = {
-                    "object": "list",
-                    "data": models,
-                }
-                utils.request._models_cache = result
-                return result
-            else:
-                raise Exception(f"fetch models info fail: {response.text}")
-
-        @staticmethod
-        def response(resp):
+        def apply_cors(resp):
                         try:
                                 origin = request.headers.get("Origin", "").strip()
                         except Exception:
@@ -1840,11 +2018,13 @@ class utils:
                         return resp
 
         @staticmethod
-        def format(data: Dict, type: str = "OpenAI"):
+        def format(data: Dict, type: str = "OpenAI", chat_id: Optional[str] = None):
             odata = {**data.copy()}
             new_messages = []
-            chat_id = odata.get("chat_id")
-            model = odata.get("model", cfg.model.default)
+            chat_id = chat_id or odata.get("chat_id")
+            requested_model = odata.get("model", cfg.model.default)
+            model = requested_model
+            is_visual_request = _is_visual_model_name(requested_model)
 
             models = utils.request.models() # 请求模型信息，以获取映射设置
             # 如果找到了映射设置
@@ -1856,6 +2036,9 @@ class utils:
                         log.debug(f"模型映射: {model} -> {source_id}")
                         model = source_id
                         break
+
+            if _is_visual_model_name(model):
+                is_visual_request = True
 
             # Anthropic - system 转换 role:system
             if "system" in odata:
@@ -1922,21 +2105,32 @@ class utils:
                                     "text": f"system: image error - Unsupported format or missing URL\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
                                 })
                                 continue
-                            # 将以 data: 编码的图片链接上传到服务器
-                            try:
-                                uploaded_url = utils.request.image(media_url, chat_id)
-                                if uploaded_url: media_url = uploaded_url
-                            except Exception as e:
-                                if isinstance(new_content, str):
-                                    new_content = [{
+
+                            requires_upload = False
+                            if isinstance(media_url, str):
+                                requires_upload = media_url.startswith("data:") or (
+                                    is_visual_request and not VISION_FILE_REFERENCE_PATTERN.match(media_url)
+                                )
+
+                            if requires_upload:
+                                try:
+                                    uploaded_url = utils.request.image(media_url, chat_id)
+                                except Exception as e:
+                                    uploaded_url = None
+                                    debug("图片上传出现异常: %s", e)
+                                if uploaded_url:
+                                    media_url = uploaded_url
+                                elif media_url.startswith("data:") or is_visual_request:
+                                    if isinstance(new_content, str):
+                                        new_content = [{
+                                            "type": "text",
+                                            "text": new_content
+                                        }]
+                                    new_content.append({
                                         "type": "text",
-                                        "text": new_content
-                                    }]
-                                new_content.append({
-                                    "type": "text",
-                                    "text": f"system: image upload error - {e}\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
-                                })
-                                continue
+                                        "text": f"system: image upload error - unable to upload or resolve image\norignal data:{json.dumps(truncate_values(item), ensure_ascii=False)}"
+                                    })
+                                    continue
 
                             if isinstance(new_content, str):
                                 new_content = [{
@@ -2144,6 +2338,101 @@ class response:
         def count(text):
             return len(enc.encode(text))
 
+utils.response = response
+utils.request.response = staticmethod(utils.apply_cors)
+utils.request.format = staticmethod(utils.format)
+
+
+
+
+
+@app.route("/")
+def status_page():
+        return _render_status_page()
+
+
+@app.route("/status")
+def status_alias():
+        return _render_status_page()
+
+
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard_view():
+        if request.method == "POST":
+                submitted = request.form.get("token", "").strip()
+                if not submitted and request.is_json:
+                        payload = request.get_json(silent=True) or {}
+                        submitted = str(payload.get("token", "")).strip()
+                if not AUTH_TOKEN:
+                        _establish_dashboard_session()
+                        return utils.request.response(redirect(url_for("dashboard_view")))
+                if submitted == AUTH_TOKEN:
+                        _establish_dashboard_session()
+                        return utils.request.response(redirect(url_for("dashboard_view")))
+                return _render_dashboard_login("访问口令错误，请重试")
+
+        if AUTH_TOKEN and not _has_dashboard_session():
+                return _render_dashboard_login()
+
+        payload = _build_dashboard_payload()
+        return _render_dashboard(payload)
+
+
+@app.route("/dashboard/logout", methods=["POST"])
+def dashboard_logout():
+        if AUTH_TOKEN:
+                _clear_dashboard_session()
+        return utils.request.response(make_response("", 204))
+
+
+@app.route("/dashboard/api/overview", methods=["GET"])
+def dashboard_api_overview():
+        auth_error = _dashboard_auth_guard()
+        if auth_error:
+                return auth_error
+        payload = _build_dashboard_payload()
+        return utils.request.response(jsonify(payload))
+
+
+@app.route("/dashboard/api/tokens", methods=["GET", "POST", "DELETE"])
+def dashboard_api_tokens():
+        auth_error = _dashboard_auth_guard()
+        if auth_error:
+                return auth_error
+
+        if request.method == "GET":
+                payload = _build_dashboard_payload()
+                return utils.request.response(jsonify(payload))
+
+        if request.method == "POST":
+                tokens = _normalized_token_submission()
+                if not tokens:
+                        return utils.request.response(jsonify({"error": "invalid_request", "message": "缺少有效 Token"})), 400
+                current = token_pool.tokens()
+                for token in tokens:
+                        if token not in current:
+                                current.append(token)
+                _update_token_pool(current)
+                payload = _build_dashboard_payload()
+
+                if request.is_json:
+                        return utils.request.response(jsonify(payload))
+                return utils.request.response(redirect(url_for("dashboard_view")))
+
+        payload = request.get_json(silent=True) or {}
+        token_id = str(payload.get("token_id") or payload.get("token") or "").strip()
+        token_value = token_pool.resolve_id(token_id) if token_id else None
+        if not token_value and token_id:
+                token_value = token_id if token_pool.contains(token_id) else None
+        if not token_value:
+                return utils.request.response(jsonify({"error": "invalid_request", "message": "未找到要移除的 Token"})), 400
+
+        remaining = [item for item in token_pool.tokens() if item != token_value]
+        _update_token_pool(remaining)
+        payload = _build_dashboard_payload()
+        return utils.request.response(jsonify(payload))
+
+
 @app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
 def models():
         if request.method == "OPTIONS":
@@ -2214,7 +2503,7 @@ def OpenAI_Compatible():
                 include_usage = odata.get("stream_options", {}).get("include_usage", True)
 
                 data = {
-                        **utils.request.format(odata, "OpenAI"),
+                        **utils.request.format(odata, "OpenAI", chat_id=id),
                         "chat_id": id,
                         "id": utils.request.id(),
                 }
@@ -2409,7 +2698,7 @@ def Anthropic_Compatible():
                 stream = odata.get("stream", False)
 
                 data = {
-                        **utils.request.format(odata, "Anthropic"),
+                        **utils.request.format(odata, "Anthropic", chat_id=id),
                         "chat_id": id,
                         "id": utils.request.id(),
                 }
